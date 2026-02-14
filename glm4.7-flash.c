@@ -20,6 +20,9 @@
 #define HEADER_SIZE 256
 #define PROMPT_BUFFER_SIZE 32768
 
+#define FLAG_ALL_ATTN 1
+#define FLAG_NATIVE_COVERAGE_FULL 2
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -112,6 +115,8 @@ typedef struct {
     Token *tokens;
     float *scores;
     int ascii_map[256];
+    uint16_t byte_to_cp[256];
+    int16_t cp_to_byte[512];
 } Tokenizer;
 
 typedef struct {
@@ -202,9 +207,143 @@ static int64_t file_size_of(const char *path) {
     return st.st_size;
 }
 
+static int utf8_encode_cp(uint32_t cp, char out[4]) {
+    if (cp <= 0x7Fu) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp <= 0x7FFu) {
+        out[0] = (char)(0xC0u | (cp >> 6));
+        out[1] = (char)(0x80u | (cp & 0x3Fu));
+        return 2;
+    }
+    if (cp <= 0xFFFFu) {
+        out[0] = (char)(0xE0u | (cp >> 12));
+        out[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[2] = (char)(0x80u | (cp & 0x3Fu));
+        return 3;
+    }
+    out[0] = (char)(0xF0u | (cp >> 18));
+    out[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+    out[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+    out[3] = (char)(0x80u | (cp & 0x3Fu));
+    return 4;
+}
+
+static size_t utf8_decode_cp(const unsigned char *s, size_t len, uint32_t *cp) {
+    if (len == 0) return 0;
+    unsigned char b0 = s[0];
+    if (b0 < 0x80u) {
+        *cp = b0;
+        return 1;
+    }
+    if ((b0 & 0xE0u) == 0xC0u && len >= 2) {
+        unsigned char b1 = s[1];
+        if ((b1 & 0xC0u) == 0x80u) {
+            uint32_t v = ((uint32_t)(b0 & 0x1Fu) << 6) | (uint32_t)(b1 & 0x3Fu);
+            if (v >= 0x80u) {
+                *cp = v;
+                return 2;
+            }
+        }
+    } else if ((b0 & 0xF0u) == 0xE0u && len >= 3) {
+        unsigned char b1 = s[1];
+        unsigned char b2 = s[2];
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+            uint32_t v = ((uint32_t)(b0 & 0x0Fu) << 12) | ((uint32_t)(b1 & 0x3Fu) << 6) | (uint32_t)(b2 & 0x3Fu);
+            if (v >= 0x800u && !(v >= 0xD800u && v <= 0xDFFFu)) {
+                *cp = v;
+                return 3;
+            }
+        }
+    } else if ((b0 & 0xF8u) == 0xF0u && len >= 4) {
+        unsigned char b1 = s[1];
+        unsigned char b2 = s[2];
+        unsigned char b3 = s[3];
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
+            uint32_t v = ((uint32_t)(b0 & 0x07u) << 18) |
+                         ((uint32_t)(b1 & 0x3Fu) << 12) |
+                         ((uint32_t)(b2 & 0x3Fu) << 6) |
+                         (uint32_t)(b3 & 0x3Fu);
+            if (v >= 0x10000u && v <= 0x10FFFFu) {
+                *cp = v;
+                return 4;
+            }
+        }
+    }
+    *cp = b0;
+    return 1;
+}
+
+static void build_byte_unicode_maps(Tokenizer *tok) {
+    int bs[256];
+    int cs[256];
+    int n = 0;
+    for (int b = 33; b <= 126; b++) bs[n++] = b;
+    for (int b = 161; b <= 172; b++) bs[n++] = b;
+    for (int b = 174; b <= 255; b++) bs[n++] = b;
+    for (int i = 0; i < n; i++) cs[i] = bs[i];
+
+    int extra = 0;
+    for (int b = 0; b < 256; b++) {
+        int present = 0;
+        for (int i = 0; i < n; i++) {
+            if (bs[i] == b) {
+                present = 1;
+                break;
+            }
+        }
+        if (!present) {
+            bs[n] = b;
+            cs[n] = 256 + extra;
+            n++;
+            extra++;
+        }
+    }
+    if (n != 256) die("invalid byte-unicode map construction");
+
+    for (int i = 0; i < 256; i++) tok->byte_to_cp[i] = 0;
+    for (int i = 0; i < 512; i++) tok->cp_to_byte[i] = -1;
+
+    for (int i = 0; i < 256; i++) {
+        int b = bs[i];
+        int cp = cs[i];
+        tok->byte_to_cp[b] = (uint16_t)cp;
+        if (cp >= 0 && cp < 512) tok->cp_to_byte[cp] = (int16_t)b;
+    }
+}
+
+static int append_decoded_token_bytes(const Tokenizer *tok, const Token *t, char *out, size_t *out_n, size_t out_cap) {
+    if (!tok || !t || !t->bytes) return 0;
+    const unsigned char *s = (const unsigned char *)t->bytes;
+    size_t i = 0;
+    while (i < t->len) {
+        uint32_t cp = 0;
+        size_t used = utf8_decode_cp(s + i, (size_t)t->len - i, &cp);
+        if (used == 0) return 0;
+        int mapped = (cp < 512u) ? tok->cp_to_byte[cp] : -1;
+        if (mapped >= 0) {
+            if (*out_n + 1 >= out_cap) return 0;
+            out[(*out_n)++] = (char)mapped;
+        } else {
+            if (*out_n + used >= out_cap) return 0;
+            memcpy(out + *out_n, s + i, used);
+            *out_n += used;
+        }
+        i += used;
+    }
+    return 1;
+}
+
+static void putchar_safe_byte(unsigned char c) {
+    if (c == '\n' || c == '\t' || c >= 0x20u) putchar((int)c);
+    else putchar(' ');
+}
+
 static void tokenizer_init(Tokenizer *tok) {
     memset(tok, 0, sizeof(*tok));
     for (int i = 0; i < 256; i++) tok->ascii_map[i] = -1;
+    build_byte_unicode_maps(tok);
 }
 
 static void tokenizer_free(Tokenizer *tok) {
@@ -442,7 +581,7 @@ static void runtime_open(Runtime *rt, const char *checkpoint) {
     rt->has_l0_attn = 0;
     rt->has_all_attn = 0;
     size_t off_after_l0_attn = (size_t)rt->cfg.off_l0_ffn_down_s + dim * hidden_groups * sizeof(float);
-    if (rt->cfg.version >= 4u && (rt->cfg.l0_flags & 1) != 0) {
+    if (rt->cfg.version >= 4u && (rt->cfg.l0_flags & FLAG_ALL_ATTN) != 0) {
         int qk_nope = rt->cfg.l0_qk_nope_dim;
         int head_k = rt->cfg.l0_head_k_dim;
         int v_head = rt->cfg.l0_v_head_dim;
@@ -859,9 +998,9 @@ static float dot_f32(const float *a, const float *b, int n) {
     return s;
 }
 
-static double sum_f32(const float *x, int n) {
-    double sum = 0.0;
-    for (int i = 0; i < n; i++) sum += (double)x[i];
+static float sum_f32(const float *x, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += x[i];
     return sum;
 }
 
@@ -976,7 +1115,7 @@ static void apply_l0_dense_ffn(const Runtime *rt, RunState *s, int gs) {
     }
 }
 
-static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, int layer_idx) {
+static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, int layer_idx, int debug_mode, int pos) {
     if (!rt->has_moe_shared) return;
     if (layer_idx <= 0 || layer_idx >= rt->cfg.n_layers) return;
     if (rt->cfg.moe_ffn_dim <= 0) return;
@@ -1028,8 +1167,23 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
         if (s->moe_topk_idx[k] >= 0) top_sum += s->moe_topk_w[k];
     }
     if (top_sum > 0.0f) {
-        float inv = 1.0f / top_sum;
+        // Match llama.cpp MoE normalization: clamp denominator to min f16 normal.
+        float denom = top_sum < 6.103515625e-5f ? 6.103515625e-5f : top_sum;
+        float inv = 1.0f / denom;
         for (int k = 0; k < top_k; k++) s->moe_topk_w[k] *= inv;
+    }
+    if (debug_mode && top_k >= 4) {
+        int s_ids = 0;
+        float norm_sum = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            if (s->moe_topk_idx[k] >= 0) {
+                s_ids += s->moe_topk_idx[k];
+                norm_sum += s->moe_topk_w[k];
+            }
+        }
+        fprintf(stderr, "[glm-moe-topk] layer=%d ids=%d,%d,%d,%d id_sum=%d pre_sum=%.6f norm_sum=%.6f w=%.6f,%.6f,%.6f,%.6f\n",
+                layer_idx, s->moe_topk_idx[0], s->moe_topk_idx[1], s->moe_topk_idx[2], s->moe_topk_idx[3], s_ids, top_sum, norm_sum,
+                s->moe_topk_w[0], s->moe_topk_w[1], s->moe_topk_w[2], s->moe_topk_w[3]);
     }
 
     memset(s->moe_out_acc, 0, (size_t)dim * sizeof(float));
@@ -1071,6 +1225,10 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
         s->moe_gate[i] = silu(s->moe_gate[i]) * s->moe_up[i];
     }
     matvec_q80_rows(w->down_sh_q, w->down_sh_s, s->moe_gate, s->xb, dim, moe_dim, gs);
+    if (debug_mode) {
+        fprintf(stderr, "[glm-layer-sum] ffn_moe_out-%d sum=%.6f\n", layer_idx, sum_f32(s->moe_out_acc, dim));
+        fprintf(stderr, "[glm-layer-sum] ffn_shexp-%d sum=%.6f\n", layer_idx, sum_f32(s->xb, dim));
+    }
     for (int i = 0; i < dim; i++) {
         s->x[i] += s->xb[i] + s->moe_out_acc[i];
     }
@@ -1155,12 +1313,21 @@ static void debug_print_prompt_embd_batch(const Runtime *rt, const int *prompt_i
     free(row);
 }
 
-static void print_token_safe(const Token *t) {
-    if (!t || !t->bytes || t->len == 0) return;
-    for (uint32_t i = 0; i < t->len; i++) {
-        unsigned char c = (unsigned char)t->bytes[i];
-        if (isprint(c) || c == '\n' || c == '\t' || c == ' ') putchar((int)c);
-        else putchar(' ');
+static void print_token_safe(const Tokenizer *tok, const Token *t) {
+    if (!tok || !t || !t->bytes || t->len == 0) return;
+    const unsigned char *s = (const unsigned char *)t->bytes;
+    size_t i = 0;
+    while (i < t->len) {
+        uint32_t cp = 0;
+        size_t used = utf8_decode_cp(s + i, (size_t)t->len - i, &cp);
+        if (used == 0) break;
+        int mapped = (cp < 512u) ? tok->cp_to_byte[cp] : -1;
+        if (mapped >= 0) {
+            putchar_safe_byte((unsigned char)mapped);
+        } else {
+            for (size_t j = 0; j < used; j++) putchar_safe_byte(s[i + j]);
+        }
+        i += used;
     }
 }
 
@@ -1206,8 +1373,13 @@ static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids,
         }
 
         if (id < 0) {
-            char b = (char)(*p);
-            id = lookup_token_id(tok, &b, 1);
+            char mapped[4];
+            int mapped_len = utf8_encode_cp((uint32_t)tok->byte_to_cp[*p], mapped);
+            id = lookup_token_id(tok, mapped, (uint32_t)mapped_len);
+            if (id < 0) {
+                char raw = (char)(*p);
+                id = lookup_token_id(tok, &raw, 1);
+            }
         }
 
         if (id >= 0 && n < max_ids) ids[n++] = id;
@@ -1319,9 +1491,7 @@ static int tokenizer_roundtrip_check(const Tokenizer *tok, const char *text, int
         int id = ids[i];
         if (id < 0 || id >= (int)tok->n_tokens) return 0;
         const Token *t = &tok->tokens[id];
-        if (out_n + t->len >= sizeof(out)) return 0;
-        memcpy(out + out_n, t->bytes, t->len);
-        out_n += t->len;
+        if (!append_decoded_token_bytes(tok, t, out, &out_n, sizeof(out))) return 0;
     }
     out[out_n] = '\0';
     return strcmp(out, text) == 0;
@@ -1333,6 +1503,8 @@ static int run_tokenizer_self_test(const Tokenizer *tok, int bos_id) {
         "abc123",
         "sum(2,3)",
         "z=",
+        "Hello i am batman. My name is",
+        "line1\nline2",
     };
     int ok = 1;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1456,7 +1628,7 @@ int main(int argc, char **argv) {
            rt.has_l0_ffn ? "on" : "off",
            rt.has_moe_shared ? "on" : "off",
            rt.has_moe_routed ? "on" : "off",
-           (rt.cfg.l0_flags & 2) ? "full" : "partial");
+           (rt.cfg.l0_flags & FLAG_NATIVE_COVERAGE_FULL) ? "full" : "partial");
     printf("  attn_layers_active=%d\n", rt.has_all_attn ? rt.cfg.n_layers : (rt.has_l0_attn ? 1 : 0));
 
     if (self_test_tokenizer) {
@@ -1576,13 +1748,33 @@ int main(int argc, char **argv) {
 
         if (rt.has_all_attn) {
             for (int l = 0; l < rt.cfg.n_layers; l++) {
+                float sum_before_attn = 0.0f;
+                if (debug_mode && pos == 0) {
+                    sum_before_attn = sum_f32(st.x, rt.cfg.dim);
+                }
                 apply_mla_attention_layer(&rt, &rt.attn_layers[l], &st, gs, pos, l);
+                float sum_before_ffn = 0.0f;
+                if (debug_mode && pos == 0) {
+                    char name[32];
+                    snprintf(name, sizeof(name), "Vcur-%d", l);
+                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st.kv_a, rt.cfg.kv_lora_rank));
+                    snprintf(name, sizeof(name), "kqv_out-%d", l);
+                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st.att_concat, rt.cfg.n_heads * rt.cfg.l0_v_head_dim));
+                    snprintf(name, sizeof(name), "ffn_inp-%d", l);
+                    debug_print_tensor_sum(name, st.x, rt.cfg.dim);
+                    snprintf(name, sizeof(name), "attn_out-%d", l);
+                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st.x, rt.cfg.dim) - sum_before_attn);
+                    sum_before_ffn = sum_f32(st.x, rt.cfg.dim);
+                }
                 if (l == 0) apply_l0_dense_ffn(&rt, &st, gs);
-                else apply_moe_shared_ffn_layer(&rt, &st, gs, l);
+                else apply_moe_shared_ffn_layer(&rt, &st, gs, l, debug_mode, pos);
                 if (debug_mode && pos == 0) {
                     char name[32];
                     snprintf(name, sizeof(name), "l_out-%d", l);
                     debug_print_tensor_sum(name, st.x, rt.cfg.dim);
+                    snprintf(name, sizeof(name), "ffn_out-%d", l);
+                    float ffn_out_sum = sum_f32(st.x, rt.cfg.dim) - sum_before_ffn;
+                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, ffn_out_sum);
                 }
             }
             assert_finite_slice("attn_stack_out", st.x, rt.cfg.dim, 0);
@@ -1622,7 +1814,7 @@ int main(int argc, char **argv) {
             next = sample_logits_temperature(st.logits, rt.cfg.vocab_size, temperature);
             if (next == rt.cfg.bos_id && rt.cfg.vocab_size > 1) next = (next + 1) % rt.cfg.vocab_size;
             if (next == rt.cfg.eos_id) break;
-            print_token_safe(&tok.tokens[next]);
+            print_token_safe(&tok, &tok.tokens[next]);
             generated++;
             if (generated >= n_tokens) break;
         }
