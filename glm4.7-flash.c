@@ -1,0 +1,1639 @@
+#include <ctype.h>
+#include <errno.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined _WIN32
+#include "win.h"
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#define MAGIC 0x67343763u
+#define VERSION 4u
+#define HEADER_SIZE 256
+#define PROMPT_BUFFER_SIZE 32768
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    int32_t dim;
+    int32_t hidden_dim;
+    int32_t n_layers;
+    int32_t n_heads;
+    int32_t n_kv_heads;
+    int32_t vocab_size;
+    int32_t seq_len;
+    int32_t rope_dim;
+    int32_t q_lora_rank;
+    int32_t kv_lora_rank;
+    int32_t kv_mqa_width;
+    int32_t n_routed_experts;
+    int32_t n_experts_used;
+    int32_t n_shared_experts;
+    int32_t bos_id;
+    int32_t eos_id;
+    uint64_t group_size;
+    uint64_t off_norm;
+    uint64_t off_tok_q;
+    uint64_t off_tok_s;
+    uint64_t off_out_q;
+    uint64_t off_out_s;
+    uint64_t total_bytes;
+    uint64_t off_l0_ffn_norm;
+    uint64_t off_l0_ffn_gate_q;
+    uint64_t off_l0_ffn_gate_s;
+    uint64_t off_l0_ffn_up_q;
+    uint64_t off_l0_ffn_up_s;
+    uint64_t off_l0_ffn_down_q;
+    uint64_t off_l0_ffn_down_s;
+    int32_t l0_qk_nope_dim;
+    int32_t l0_head_k_dim;
+    int32_t l0_v_head_dim;
+    int32_t l0_flags;
+    int32_t moe_ffn_dim;
+} RuntimeConfig;
+
+typedef struct {
+    const float *attn_norm;     // [dim]
+    const float *q_a_norm;      // [q_lora_rank]
+    const float *kv_a_norm;     // [kv_lora_rank]
+    const int8_t *q_a_q;        // [q_lora_rank, dim]
+    const float *q_a_s;         // [q_lora_rank, dim/gs]
+    const int8_t *q_b_q;        // [n_heads*head_k, q_lora_rank]
+    const float *q_b_s;         // [n_heads*head_k, q_lora_rank/gs]
+    const int8_t *kv_a_q;       // [kv_lora_rank + rope_dim, dim]
+    const float *kv_a_s;        // [kv_lora_rank + rope_dim, dim/gs]
+    const int8_t *k_b_q;        // [n_heads*kv_lora_rank, qk_nope]
+    const float *k_b_s;         // [n_heads*kv_lora_rank, qk_nope/gs]
+    const int8_t *v_b_q;        // [n_heads*v_head, kv_lora_rank]
+    const float *v_b_s;         // [n_heads*v_head, kv_lora_rank/gs]
+    const int8_t *attn_out_q;   // [dim, n_heads*v_head]
+    const float *attn_out_s;    // [dim, (n_heads*v_head)/gs]
+} LayerAttnWeights;
+
+typedef struct {
+    const float *ffn_norm;      // [dim]
+    const float *gate_inp;      // [n_routed_experts, dim]
+    const float *exp_probs_b;   // [n_routed_experts]
+    const int8_t *gate_sh_q;    // [moe_ffn_dim, dim]
+    const float *gate_sh_s;     // [moe_ffn_dim, dim/gs]
+    const int8_t *up_sh_q;      // [moe_ffn_dim, dim]
+    const float *up_sh_s;       // [moe_ffn_dim, dim/gs]
+    const int8_t *down_sh_q;    // [dim, moe_ffn_dim]
+    const float *down_sh_s;     // [dim, moe_ffn_dim/gs]
+} LayerMoeShared;
+
+typedef struct {
+    const int8_t *gate_q;       // [n_routed_experts*moe_ffn_dim, dim]
+    const float *gate_s;        // [n_routed_experts*moe_ffn_dim, dim/gs]
+    const int8_t *up_q;         // [n_routed_experts*moe_ffn_dim, dim]
+    const float *up_s;          // [n_routed_experts*moe_ffn_dim, dim/gs]
+    const int8_t *down_q;       // [n_routed_experts*dim, moe_ffn_dim]
+    const float *down_s;        // [n_routed_experts*dim, moe_ffn_dim/gs]
+} LayerMoeRouted;
+
+typedef struct {
+    char *bytes;
+    uint32_t len;
+} Token;
+
+typedef struct {
+    uint32_t max_token_len;
+    uint32_t bos_id;
+    uint32_t eos_id;
+    size_t n_tokens;
+    Token *tokens;
+    float *scores;
+    int ascii_map[256];
+} Tokenizer;
+
+typedef struct {
+    RuntimeConfig cfg;
+    unsigned char *data;
+    size_t file_size;
+
+    const float *output_norm;      // [dim]
+    const int8_t *tok_q;           // [vocab, dim]
+    const float *tok_s;            // [vocab, dim/gs]
+    const int8_t *out_q;           // [vocab, dim]
+    const float *out_s;            // [vocab, dim/gs]
+
+    int has_l0_ffn;
+    const float *l0_ffn_norm;      // [dim]
+    const int8_t *l0_ffn_gate_q;   // [hidden_dim, dim]
+    const float *l0_ffn_gate_s;    // [hidden_dim, dim/gs]
+    const int8_t *l0_ffn_up_q;     // [hidden_dim, dim]
+    const float *l0_ffn_up_s;      // [hidden_dim, dim/gs]
+    const int8_t *l0_ffn_down_q;   // [dim, hidden_dim]
+    const float *l0_ffn_down_s;    // [dim, hidden_dim/gs]
+
+    int has_l0_attn;
+    const float *l0_attn_norm;     // [dim]
+    const float *l0_q_a_norm;      // [q_lora_rank]
+    const float *l0_kv_a_norm;     // [kv_lora_rank]
+    const int8_t *l0_q_a_q;        // [q_lora_rank, dim]
+    const float *l0_q_a_s;         // [q_lora_rank, dim/gs]
+    const int8_t *l0_q_b_q;        // [n_heads*head_k, q_lora_rank]
+    const float *l0_q_b_s;         // [n_heads*head_k, q_lora_rank/gs]
+    const int8_t *l0_kv_a_q;       // [kv_lora_rank + rope_dim, dim]
+    const float *l0_kv_a_s;        // [kv_lora_rank + rope_dim, dim/gs]
+    const int8_t *l0_k_b_q;        // [n_heads*kv_lora_rank, qk_nope]
+    const float *l0_k_b_s;         // [n_heads*kv_lora_rank, qk_nope/gs]
+    const int8_t *l0_v_b_q;        // [n_heads*v_head, kv_lora_rank]
+    const float *l0_v_b_s;         // [n_heads*v_head, kv_lora_rank/gs]
+    const int8_t *l0_attn_out_q;   // [dim, n_heads*v_head]
+    const float *l0_attn_out_s;    // [dim, (n_heads*v_head)/gs]
+
+    int has_all_attn;
+    LayerAttnWeights *attn_layers; // [n_layers] when present
+
+    int has_moe_shared;
+    LayerMoeShared *moe_layers; // [n_layers], layers 1..n_layers-1 populated
+    int has_moe_routed;
+    LayerMoeRouted *moe_routed_layers; // [n_layers], layers 1..n_layers-1 populated
+} Runtime;
+
+typedef struct {
+    float *x;       // [dim]
+    float *xn;      // [dim]
+    float *xb;      // [dim]
+    float *ff_gate; // [hidden_dim]
+    float *ff_up;   // [hidden_dim]
+    float *logits;  // [vocab]
+
+    int cache_cap;
+    int n_attn_layers;
+    float *k_cache_comp;   // [n_attn_layers, cache_cap, kv_lora_rank]
+    float *k_cache_pe;     // [n_attn_layers, cache_cap, rope_dim]
+    float *q_a;            // [q_lora_rank]
+    float *q_full;         // [n_heads*head_k]
+    float *kv_a;           // [kv_lora_rank + rope_dim]
+    float *q_nope;         // [qk_nope_dim]
+    float *q_pe;           // [rope_dim]
+    float *q_abs;          // [kv_lora_rank]
+    float *att_scores;     // [cache_cap]
+    float *att_ctx;        // [kv_lora_rank]
+    float *att_concat;     // [n_heads*v_head]
+    float *moe_gate;       // [moe_ffn_dim]
+    float *moe_up;         // [moe_ffn_dim]
+    float *moe_router;     // [n_routed_experts]
+    float *moe_out_acc;    // [dim]
+    int *moe_topk_idx;     // [n_experts_used]
+    float *moe_topk_w;     // [n_experts_used]
+} RunState;
+
+static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids, int max_ids, int bos);
+
+static void die(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    exit(EXIT_FAILURE);
+}
+
+static int64_t file_size_of(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return st.st_size;
+}
+
+static void tokenizer_init(Tokenizer *tok) {
+    memset(tok, 0, sizeof(*tok));
+    for (int i = 0; i < 256; i++) tok->ascii_map[i] = -1;
+}
+
+static void tokenizer_free(Tokenizer *tok) {
+    if (tok->tokens != NULL) {
+        for (size_t i = 0; i < tok->n_tokens; i++) free(tok->tokens[i].bytes);
+        free(tok->tokens);
+    }
+    free(tok->scores);
+    tokenizer_init(tok);
+}
+
+static void build_ascii_map(Tokenizer *tok) {
+    for (size_t i = 0; i < tok->n_tokens; i++) {
+        if (tok->tokens[i].len == 1) {
+            unsigned char c = (unsigned char)tok->tokens[i].bytes[0];
+            tok->ascii_map[c] = (int)i;
+        }
+    }
+}
+
+static void load_tokenizer(const char *checkpoint_path, Tokenizer *tok, int vocab_size) {
+    tokenizer_init(tok);
+
+    size_t n = strlen(checkpoint_path) + strlen(".tokenizer") + 1;
+    char *path = (char *)malloc(n);
+    if (!path) die("out of memory");
+    snprintf(path, n, "%s.tokenizer", checkpoint_path);
+
+    FILE *f = fopen(path, "rb");
+    free(path);
+    if (!f) die("failed to open tokenizer sidecar");
+
+    if (fread(&tok->max_token_len, sizeof(uint32_t), 1, f) != 1 ||
+        fread(&tok->bos_id, sizeof(uint32_t), 1, f) != 1 ||
+        fread(&tok->eos_id, sizeof(uint32_t), 1, f) != 1) {
+        fclose(f);
+        die("failed tokenizer header read");
+    }
+
+    tok->n_tokens = (size_t)vocab_size;
+    tok->tokens = (Token *)calloc(tok->n_tokens, sizeof(Token));
+    tok->scores = (float *)calloc(tok->n_tokens, sizeof(float));
+    if (!tok->tokens) {
+        fclose(f);
+        die("out of memory");
+    }
+    if (!tok->scores) {
+        fclose(f);
+        die("out of memory");
+    }
+
+    for (size_t i = 0; i < tok->n_tokens; i++) {
+        float score;
+        uint32_t len;
+        if (fread(&score, sizeof(float), 1, f) != 1 || fread(&len, sizeof(uint32_t), 1, f) != 1) {
+            fclose(f);
+            die("failed tokenizer token header read");
+        }
+        (void)score;
+        tok->scores[i] = score;
+        tok->tokens[i].len = len;
+        tok->tokens[i].bytes = (char *)malloc((size_t)len + 1);
+        if (!tok->tokens[i].bytes) {
+            fclose(f);
+            die("out of memory");
+        }
+        if (len > 0 && fread(tok->tokens[i].bytes, 1, len, f) != len) {
+            fclose(f);
+            die("failed tokenizer token bytes read");
+        }
+        tok->tokens[i].bytes[len] = '\0';
+    }
+    fclose(f);
+    build_ascii_map(tok);
+}
+
+static int load_template_text(const char *checkpoint_path, const char *suffix, char *out, size_t out_cap) {
+    if (out_cap == 0) return 0;
+    size_t n = strlen(checkpoint_path) + strlen(suffix) + 1;
+    char *path = (char *)malloc(n);
+    if (!path) die("out of memory");
+    snprintf(path, n, "%s%s", checkpoint_path, suffix);
+    FILE *f = fopen(path, "rb");
+    free(path);
+    if (!f) return 0;
+    size_t got = fread(out, 1, out_cap - 1, f);
+    fclose(f);
+    out[got] = '\0';
+    return got > 0;
+}
+
+static void render_template_user(const char *templ, const char *user, char *out, size_t out_cap) {
+    if (out_cap == 0) return;
+    if (!templ || templ[0] == '\0') {
+        snprintf(out, out_cap, "%s", user ? user : "");
+        return;
+    }
+    const char *p = strstr(templ, "%s");
+    if (!p) {
+        snprintf(out, out_cap, "%s%s", templ, user ? user : "");
+        return;
+    }
+    size_t pre = (size_t)(p - templ);
+    size_t wrote = 0;
+    if (pre > 0) {
+        size_t n = pre < (out_cap - 1) ? pre : (out_cap - 1);
+        memcpy(out, templ, n);
+        wrote = n;
+    }
+    if (wrote < out_cap - 1 && user) {
+        size_t room = out_cap - 1 - wrote;
+        size_t ulen = strlen(user);
+        size_t n = ulen < room ? ulen : room;
+        memcpy(out + wrote, user, n);
+        wrote += n;
+    }
+    const char *post = p + 2;
+    if (wrote < out_cap - 1 && *post) {
+        size_t room = out_cap - 1 - wrote;
+        size_t plen = strlen(post);
+        size_t n = plen < room ? plen : room;
+        memcpy(out + wrote, post, n);
+        wrote += n;
+    }
+    out[wrote] = '\0';
+}
+
+static void runtime_close(Runtime *rt) {
+    free(rt->attn_layers);
+    free(rt->moe_layers);
+    free(rt->moe_routed_layers);
+#if !defined _WIN32
+    if (rt->data != NULL && rt->file_size > 0) {
+        munmap(rt->data, rt->file_size);
+    }
+#endif
+    memset(rt, 0, sizeof(*rt));
+}
+
+static int offset_ok(size_t file_size, uint64_t off, size_t bytes) {
+    if ((size_t)off > file_size) return 0;
+    if (bytes > file_size - (size_t)off) return 0;
+    return 1;
+}
+
+static void runtime_open(Runtime *rt, const char *checkpoint) {
+    memset(rt, 0, sizeof(*rt));
+
+    int64_t fs = file_size_of(checkpoint);
+    if (fs <= 0) die("failed to stat checkpoint");
+    rt->file_size = (size_t)fs;
+
+#if !defined _WIN32
+    int fd = open(checkpoint, O_RDONLY);
+    if (fd < 0) die("failed to open checkpoint");
+    rt->data = (unsigned char *)mmap(NULL, rt->file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (rt->data == MAP_FAILED) die("mmap failed");
+#endif
+
+    if (rt->file_size < HEADER_SIZE) die("checkpoint too small");
+    memset(&rt->cfg, 0, sizeof(RuntimeConfig));
+    size_t copy = sizeof(RuntimeConfig) < HEADER_SIZE ? sizeof(RuntimeConfig) : HEADER_SIZE;
+    memcpy(&rt->cfg, rt->data, copy);
+
+    if (rt->cfg.magic != MAGIC) die("invalid checkpoint magic");
+    if (rt->cfg.version != 2u && rt->cfg.version != 3u && rt->cfg.version != VERSION) die("unsupported checkpoint version");
+    if ((size_t)rt->cfg.total_bytes != rt->file_size) die("checkpoint size mismatch");
+    if (rt->cfg.group_size == 0) die("invalid group size");
+    if (rt->cfg.dim <= 0 || rt->cfg.hidden_dim <= 0 || rt->cfg.vocab_size <= 0) die("invalid dimensions in checkpoint");
+    if (rt->cfg.dim % (int)rt->cfg.group_size != 0) die("dim must be divisible by group size");
+    if (rt->cfg.hidden_dim % (int)rt->cfg.group_size != 0) die("hidden_dim must be divisible by group size");
+    if (rt->cfg.q_lora_rank % (int)rt->cfg.group_size != 0) die("q_lora_rank must be divisible by group size");
+    if (rt->cfg.kv_lora_rank % (int)rt->cfg.group_size != 0) die("kv_lora_rank must be divisible by group size");
+
+    size_t dim = (size_t)rt->cfg.dim;
+    size_t hidden = (size_t)rt->cfg.hidden_dim;
+    size_t vocab = (size_t)rt->cfg.vocab_size;
+    size_t gs = (size_t)rt->cfg.group_size;
+    size_t dim_groups = dim / gs;
+    size_t hidden_groups = hidden / gs;
+
+    size_t norm_bytes = dim * sizeof(float);
+    size_t tok_q_bytes = vocab * dim * sizeof(int8_t);
+    size_t tok_s_bytes = vocab * dim_groups * sizeof(float);
+    size_t out_q_bytes = vocab * dim * sizeof(int8_t);
+    size_t out_s_bytes = vocab * dim_groups * sizeof(float);
+
+    if (!offset_ok(rt->file_size, rt->cfg.off_norm, norm_bytes) ||
+        !offset_ok(rt->file_size, rt->cfg.off_tok_q, tok_q_bytes) ||
+        !offset_ok(rt->file_size, rt->cfg.off_tok_s, tok_s_bytes) ||
+        !offset_ok(rt->file_size, rt->cfg.off_out_q, out_q_bytes) ||
+        !offset_ok(rt->file_size, rt->cfg.off_out_s, out_s_bytes)) {
+        die("checkpoint base tensor offsets out of bounds");
+    }
+
+    rt->output_norm = (const float *)(rt->data + rt->cfg.off_norm);
+    rt->tok_q = (const int8_t *)(rt->data + rt->cfg.off_tok_q);
+    rt->tok_s = (const float *)(rt->data + rt->cfg.off_tok_s);
+    rt->out_q = (const int8_t *)(rt->data + rt->cfg.off_out_q);
+    rt->out_s = (const float *)(rt->data + rt->cfg.off_out_s);
+
+    // Optional extension block for version 3+: layer-0 dense FFN weights.
+    rt->has_l0_ffn = 0;
+    if (rt->cfg.version >= 3u && rt->cfg.off_l0_ffn_norm != 0) {
+        size_t l0_norm_bytes = dim * sizeof(float);
+        size_t l0_gate_q_bytes = hidden * dim * sizeof(int8_t);
+        size_t l0_gate_s_bytes = hidden * dim_groups * sizeof(float);
+        size_t l0_up_q_bytes = hidden * dim * sizeof(int8_t);
+        size_t l0_up_s_bytes = hidden * dim_groups * sizeof(float);
+        size_t l0_down_q_bytes = dim * hidden * sizeof(int8_t);
+        size_t l0_down_s_bytes = dim * hidden_groups * sizeof(float);
+
+        if (!offset_ok(rt->file_size, rt->cfg.off_l0_ffn_norm, l0_norm_bytes) ||
+            !offset_ok(rt->file_size, rt->cfg.off_l0_ffn_gate_q, l0_gate_q_bytes) ||
+            !offset_ok(rt->file_size, rt->cfg.off_l0_ffn_gate_s, l0_gate_s_bytes) ||
+            !offset_ok(rt->file_size, rt->cfg.off_l0_ffn_up_q, l0_up_q_bytes) ||
+            !offset_ok(rt->file_size, rt->cfg.off_l0_ffn_up_s, l0_up_s_bytes) ||
+            !offset_ok(rt->file_size, rt->cfg.off_l0_ffn_down_q, l0_down_q_bytes) ||
+            !offset_ok(rt->file_size, rt->cfg.off_l0_ffn_down_s, l0_down_s_bytes)) {
+            die("checkpoint layer-0 FFN offsets out of bounds");
+        }
+
+        rt->l0_ffn_norm = (const float *)(rt->data + rt->cfg.off_l0_ffn_norm);
+        rt->l0_ffn_gate_q = (const int8_t *)(rt->data + rt->cfg.off_l0_ffn_gate_q);
+        rt->l0_ffn_gate_s = (const float *)(rt->data + rt->cfg.off_l0_ffn_gate_s);
+        rt->l0_ffn_up_q = (const int8_t *)(rt->data + rt->cfg.off_l0_ffn_up_q);
+        rt->l0_ffn_up_s = (const float *)(rt->data + rt->cfg.off_l0_ffn_up_s);
+        rt->l0_ffn_down_q = (const int8_t *)(rt->data + rt->cfg.off_l0_ffn_down_q);
+        rt->l0_ffn_down_s = (const float *)(rt->data + rt->cfg.off_l0_ffn_down_s);
+        rt->has_l0_ffn = 1;
+    }
+
+    // Optional extension block for version 4+: layer-0 MLA attention.
+    rt->has_l0_attn = 0;
+    rt->has_all_attn = 0;
+    size_t off_after_l0_attn = (size_t)rt->cfg.off_l0_ffn_down_s + dim * hidden_groups * sizeof(float);
+    if (rt->cfg.version >= 4u && (rt->cfg.l0_flags & 1) != 0) {
+        int qk_nope = rt->cfg.l0_qk_nope_dim;
+        int head_k = rt->cfg.l0_head_k_dim;
+        int v_head = rt->cfg.l0_v_head_dim;
+        if (qk_nope <= 0 || head_k <= 0 || v_head <= 0) die("invalid v4 mla dims");
+        if (head_k != qk_nope + rt->cfg.rope_dim) die("invalid v4 mla shape relation");
+        if (qk_nope % (int)rt->cfg.group_size != 0) die("qk_nope dim must be divisible by group size");
+        if ((rt->cfg.n_heads * v_head) % (int)rt->cfg.group_size != 0) die("attn out width must be divisible by group size");
+
+        size_t q_lora = (size_t)rt->cfg.q_lora_rank;
+        size_t kv_lora = (size_t)rt->cfg.kv_lora_rank;
+        size_t rope = (size_t)rt->cfg.rope_dim;
+        size_t n_heads = (size_t)rt->cfg.n_heads;
+        size_t qk_nope_sz = (size_t)qk_nope;
+        size_t head_k_sz = (size_t)head_k;
+        size_t v_head_sz = (size_t)v_head;
+        size_t q_lora_groups = q_lora / gs;
+        size_t kv_lora_groups = kv_lora / gs;
+        size_t qk_nope_groups = qk_nope_sz / gs;
+        size_t attn_out_cols = n_heads * v_head_sz;
+        size_t attn_out_groups = attn_out_cols / gs;
+
+        size_t bytes_l0_attn_norm = dim * sizeof(float);
+        size_t bytes_l0_q_a_norm = q_lora * sizeof(float);
+        size_t bytes_l0_kv_a_norm = kv_lora * sizeof(float);
+        size_t bytes_l0_q_a_q = q_lora * dim * sizeof(int8_t);
+        size_t bytes_l0_q_a_s = q_lora * dim_groups * sizeof(float);
+        size_t bytes_l0_q_b_q = n_heads * head_k_sz * q_lora * sizeof(int8_t);
+        size_t bytes_l0_q_b_s = n_heads * head_k_sz * q_lora_groups * sizeof(float);
+        size_t bytes_l0_kv_a_q = (kv_lora + rope) * dim * sizeof(int8_t);
+        size_t bytes_l0_kv_a_s = (kv_lora + rope) * dim_groups * sizeof(float);
+        size_t bytes_l0_k_b_q = n_heads * kv_lora * qk_nope_sz * sizeof(int8_t);
+        size_t bytes_l0_k_b_s = n_heads * kv_lora * qk_nope_groups * sizeof(float);
+        size_t bytes_l0_v_b_q = n_heads * v_head_sz * kv_lora * sizeof(int8_t);
+        size_t bytes_l0_v_b_s = n_heads * v_head_sz * kv_lora_groups * sizeof(float);
+        size_t bytes_l0_attn_out_q = dim * attn_out_cols * sizeof(int8_t);
+        size_t bytes_l0_attn_out_s = dim * attn_out_groups * sizeof(float);
+
+        size_t off = (size_t)rt->cfg.off_l0_ffn_down_s + dim * hidden_groups * sizeof(float);
+        if (!offset_ok(rt->file_size, off, bytes_l0_attn_norm)) die("l0 attn_norm out of bounds");
+        rt->l0_attn_norm = (const float *)(rt->data + off);
+        off += bytes_l0_attn_norm;
+        if (!offset_ok(rt->file_size, off, bytes_l0_q_a_norm)) die("l0 q_a_norm out of bounds");
+        rt->l0_q_a_norm = (const float *)(rt->data + off);
+        off += bytes_l0_q_a_norm;
+        if (!offset_ok(rt->file_size, off, bytes_l0_kv_a_norm)) die("l0 kv_a_norm out of bounds");
+        rt->l0_kv_a_norm = (const float *)(rt->data + off);
+        off += bytes_l0_kv_a_norm;
+        if (!offset_ok(rt->file_size, off, bytes_l0_q_a_q)) die("l0 q_a_q out of bounds");
+        rt->l0_q_a_q = (const int8_t *)(rt->data + off);
+        off += bytes_l0_q_a_q;
+        if (!offset_ok(rt->file_size, off, bytes_l0_q_a_s)) die("l0 q_a_s out of bounds");
+        rt->l0_q_a_s = (const float *)(rt->data + off);
+        off += bytes_l0_q_a_s;
+        if (!offset_ok(rt->file_size, off, bytes_l0_q_b_q)) die("l0 q_b_q out of bounds");
+        rt->l0_q_b_q = (const int8_t *)(rt->data + off);
+        off += bytes_l0_q_b_q;
+        if (!offset_ok(rt->file_size, off, bytes_l0_q_b_s)) die("l0 q_b_s out of bounds");
+        rt->l0_q_b_s = (const float *)(rt->data + off);
+        off += bytes_l0_q_b_s;
+        if (!offset_ok(rt->file_size, off, bytes_l0_kv_a_q)) die("l0 kv_a_q out of bounds");
+        rt->l0_kv_a_q = (const int8_t *)(rt->data + off);
+        off += bytes_l0_kv_a_q;
+        if (!offset_ok(rt->file_size, off, bytes_l0_kv_a_s)) die("l0 kv_a_s out of bounds");
+        rt->l0_kv_a_s = (const float *)(rt->data + off);
+        off += bytes_l0_kv_a_s;
+        if (!offset_ok(rt->file_size, off, bytes_l0_k_b_q)) die("l0 k_b_q out of bounds");
+        rt->l0_k_b_q = (const int8_t *)(rt->data + off);
+        off += bytes_l0_k_b_q;
+        if (!offset_ok(rt->file_size, off, bytes_l0_k_b_s)) die("l0 k_b_s out of bounds");
+        rt->l0_k_b_s = (const float *)(rt->data + off);
+        off += bytes_l0_k_b_s;
+        if (!offset_ok(rt->file_size, off, bytes_l0_v_b_q)) die("l0 v_b_q out of bounds");
+        rt->l0_v_b_q = (const int8_t *)(rt->data + off);
+        off += bytes_l0_v_b_q;
+        if (!offset_ok(rt->file_size, off, bytes_l0_v_b_s)) die("l0 v_b_s out of bounds");
+        rt->l0_v_b_s = (const float *)(rt->data + off);
+        off += bytes_l0_v_b_s;
+        if (!offset_ok(rt->file_size, off, bytes_l0_attn_out_q)) die("l0 attn_out_q out of bounds");
+        rt->l0_attn_out_q = (const int8_t *)(rt->data + off);
+        off += bytes_l0_attn_out_q;
+        if (!offset_ok(rt->file_size, off, bytes_l0_attn_out_s)) die("l0 attn_out_s out of bounds");
+        rt->l0_attn_out_s = (const float *)(rt->data + off);
+        off += bytes_l0_attn_out_s;
+        if (off > rt->file_size) die("l0 mla offsets overflow");
+
+        rt->has_l0_attn = 1;
+        off_after_l0_attn = off;
+    }
+
+    // Optional appended block: per-layer attention tensors for all layers.
+    size_t off_after_all_attn = off_after_l0_attn;
+    if (rt->has_l0_attn) {
+        int qk_nope = rt->cfg.l0_qk_nope_dim;
+        int head_k = rt->cfg.l0_head_k_dim;
+        int v_head = rt->cfg.l0_v_head_dim;
+        size_t q_lora = (size_t)rt->cfg.q_lora_rank;
+        size_t kv_lora = (size_t)rt->cfg.kv_lora_rank;
+        size_t rope = (size_t)rt->cfg.rope_dim;
+        size_t n_heads = (size_t)rt->cfg.n_heads;
+        size_t qk_nope_sz = (size_t)qk_nope;
+        size_t head_k_sz = (size_t)head_k;
+        size_t v_head_sz = (size_t)v_head;
+        size_t q_lora_groups = q_lora / gs;
+        size_t kv_lora_groups = kv_lora / gs;
+        size_t qk_nope_groups = qk_nope_sz / gs;
+        size_t attn_out_cols = n_heads * v_head_sz;
+        size_t attn_out_groups = attn_out_cols / gs;
+
+        size_t bytes_attn_norm = dim * sizeof(float);
+        size_t bytes_q_a_norm = q_lora * sizeof(float);
+        size_t bytes_kv_a_norm = kv_lora * sizeof(float);
+        size_t bytes_q_a_q = q_lora * dim * sizeof(int8_t);
+        size_t bytes_q_a_s = q_lora * dim_groups * sizeof(float);
+        size_t bytes_q_b_q = n_heads * head_k_sz * q_lora * sizeof(int8_t);
+        size_t bytes_q_b_s = n_heads * head_k_sz * q_lora_groups * sizeof(float);
+        size_t bytes_kv_a_q = (kv_lora + rope) * dim * sizeof(int8_t);
+        size_t bytes_kv_a_s = (kv_lora + rope) * dim_groups * sizeof(float);
+        size_t bytes_k_b_q = n_heads * kv_lora * qk_nope_sz * sizeof(int8_t);
+        size_t bytes_k_b_s = n_heads * kv_lora * qk_nope_groups * sizeof(float);
+        size_t bytes_v_b_q = n_heads * v_head_sz * kv_lora * sizeof(int8_t);
+        size_t bytes_v_b_s = n_heads * v_head_sz * kv_lora_groups * sizeof(float);
+        size_t bytes_attn_out_q = dim * attn_out_cols * sizeof(int8_t);
+        size_t bytes_attn_out_s = dim * attn_out_groups * sizeof(float);
+        size_t bytes_per_layer =
+            bytes_attn_norm + bytes_q_a_norm + bytes_kv_a_norm + bytes_q_a_q + bytes_q_a_s + bytes_q_b_q + bytes_q_b_s +
+            bytes_kv_a_q + bytes_kv_a_s + bytes_k_b_q + bytes_k_b_s + bytes_v_b_q + bytes_v_b_s + bytes_attn_out_q + bytes_attn_out_s;
+        size_t n_layers = (size_t)rt->cfg.n_layers;
+        size_t bytes_all_layers = bytes_per_layer * n_layers;
+
+        if (off_after_l0_attn < rt->file_size) {
+            if (bytes_all_layers > rt->file_size - off_after_l0_attn) {
+                die("incomplete all-layer attention block");
+            }
+            rt->attn_layers = (LayerAttnWeights *)calloc(n_layers, sizeof(LayerAttnWeights));
+            if (!rt->attn_layers) die("out of memory");
+
+            size_t off = off_after_l0_attn;
+            for (size_t li = 0; li < n_layers; li++) {
+                LayerAttnWeights *w = &rt->attn_layers[li];
+                if (!offset_ok(rt->file_size, off, bytes_attn_norm)) die("all-attn attn_norm out of bounds");
+                w->attn_norm = (const float *)(rt->data + off);
+                off += bytes_attn_norm;
+                if (!offset_ok(rt->file_size, off, bytes_q_a_norm)) die("all-attn q_a_norm out of bounds");
+                w->q_a_norm = (const float *)(rt->data + off);
+                off += bytes_q_a_norm;
+                if (!offset_ok(rt->file_size, off, bytes_kv_a_norm)) die("all-attn kv_a_norm out of bounds");
+                w->kv_a_norm = (const float *)(rt->data + off);
+                off += bytes_kv_a_norm;
+                if (!offset_ok(rt->file_size, off, bytes_q_a_q)) die("all-attn q_a_q out of bounds");
+                w->q_a_q = (const int8_t *)(rt->data + off);
+                off += bytes_q_a_q;
+                if (!offset_ok(rt->file_size, off, bytes_q_a_s)) die("all-attn q_a_s out of bounds");
+                w->q_a_s = (const float *)(rt->data + off);
+                off += bytes_q_a_s;
+                if (!offset_ok(rt->file_size, off, bytes_q_b_q)) die("all-attn q_b_q out of bounds");
+                w->q_b_q = (const int8_t *)(rt->data + off);
+                off += bytes_q_b_q;
+                if (!offset_ok(rt->file_size, off, bytes_q_b_s)) die("all-attn q_b_s out of bounds");
+                w->q_b_s = (const float *)(rt->data + off);
+                off += bytes_q_b_s;
+                if (!offset_ok(rt->file_size, off, bytes_kv_a_q)) die("all-attn kv_a_q out of bounds");
+                w->kv_a_q = (const int8_t *)(rt->data + off);
+                off += bytes_kv_a_q;
+                if (!offset_ok(rt->file_size, off, bytes_kv_a_s)) die("all-attn kv_a_s out of bounds");
+                w->kv_a_s = (const float *)(rt->data + off);
+                off += bytes_kv_a_s;
+                if (!offset_ok(rt->file_size, off, bytes_k_b_q)) die("all-attn k_b_q out of bounds");
+                w->k_b_q = (const int8_t *)(rt->data + off);
+                off += bytes_k_b_q;
+                if (!offset_ok(rt->file_size, off, bytes_k_b_s)) die("all-attn k_b_s out of bounds");
+                w->k_b_s = (const float *)(rt->data + off);
+                off += bytes_k_b_s;
+                if (!offset_ok(rt->file_size, off, bytes_v_b_q)) die("all-attn v_b_q out of bounds");
+                w->v_b_q = (const int8_t *)(rt->data + off);
+                off += bytes_v_b_q;
+                if (!offset_ok(rt->file_size, off, bytes_v_b_s)) die("all-attn v_b_s out of bounds");
+                w->v_b_s = (const float *)(rt->data + off);
+                off += bytes_v_b_s;
+                if (!offset_ok(rt->file_size, off, bytes_attn_out_q)) die("all-attn attn_out_q out of bounds");
+                w->attn_out_q = (const int8_t *)(rt->data + off);
+                off += bytes_attn_out_q;
+                if (!offset_ok(rt->file_size, off, bytes_attn_out_s)) die("all-attn attn_out_s out of bounds");
+                w->attn_out_s = (const float *)(rt->data + off);
+                off += bytes_attn_out_s;
+            }
+            rt->has_all_attn = 1;
+            off_after_all_attn = off;
+        }
+    }
+
+    // Optional appended block: shared-expert FFN tensors for MoE layers 1..n_layers-1.
+    rt->has_moe_shared = 0;
+    rt->has_moe_routed = 0;
+    size_t off_after_moe_shared = off_after_all_attn;
+    if (rt->cfg.moe_ffn_dim > 0 && rt->cfg.n_layers > 1 && off_after_all_attn < rt->file_size) {
+        size_t moe_dim = (size_t)rt->cfg.moe_ffn_dim;
+        if (moe_dim % gs != 0) die("moe_ffn_dim must be divisible by group size");
+        size_t moe_groups = moe_dim / gs;
+        size_t n_layers = (size_t)rt->cfg.n_layers;
+        size_t n_routed = (size_t)rt->cfg.n_routed_experts;
+        size_t dim_groups_local = dim / gs;
+
+        size_t bytes_ffn_norm = dim * sizeof(float);
+        size_t bytes_gate_inp = n_routed * dim * sizeof(float);
+        size_t bytes_exp_probs_b = n_routed * sizeof(float);
+        size_t bytes_gate_sh_q = moe_dim * dim * sizeof(int8_t);
+        size_t bytes_gate_sh_s = moe_dim * dim_groups_local * sizeof(float);
+        size_t bytes_up_sh_q = moe_dim * dim * sizeof(int8_t);
+        size_t bytes_up_sh_s = moe_dim * dim_groups_local * sizeof(float);
+        size_t bytes_down_sh_q = dim * moe_dim * sizeof(int8_t);
+        size_t bytes_down_sh_s = dim * moe_groups * sizeof(float);
+        size_t bytes_per_layer_shared =
+            bytes_ffn_norm + bytes_gate_inp + bytes_exp_probs_b + bytes_gate_sh_q + bytes_gate_sh_s +
+            bytes_up_sh_q + bytes_up_sh_s + bytes_down_sh_q + bytes_down_sh_s;
+        size_t n_moe_layers = n_layers - 1;
+        size_t bytes_total_shared = bytes_per_layer_shared * n_moe_layers;
+
+        if (bytes_total_shared > rt->file_size - off_after_all_attn) die("incomplete moe shared block");
+        rt->moe_layers = (LayerMoeShared *)calloc(n_layers, sizeof(LayerMoeShared));
+        if (!rt->moe_layers) die("out of memory");
+
+        size_t off = off_after_all_attn;
+        for (size_t li = 1; li < n_layers; li++) {
+            LayerMoeShared *w = &rt->moe_layers[li];
+            if (!offset_ok(rt->file_size, off, bytes_ffn_norm)) die("moe ffn_norm out of bounds");
+            w->ffn_norm = (const float *)(rt->data + off);
+            off += bytes_ffn_norm;
+            if (!offset_ok(rt->file_size, off, bytes_gate_inp)) die("moe gate_inp out of bounds");
+            w->gate_inp = (const float *)(rt->data + off);
+            off += bytes_gate_inp;
+            if (!offset_ok(rt->file_size, off, bytes_exp_probs_b)) die("moe exp_probs_b out of bounds");
+            w->exp_probs_b = (const float *)(rt->data + off);
+            off += bytes_exp_probs_b;
+            if (!offset_ok(rt->file_size, off, bytes_gate_sh_q)) die("moe gate_sh_q out of bounds");
+            w->gate_sh_q = (const int8_t *)(rt->data + off);
+            off += bytes_gate_sh_q;
+            if (!offset_ok(rt->file_size, off, bytes_gate_sh_s)) die("moe gate_sh_s out of bounds");
+            w->gate_sh_s = (const float *)(rt->data + off);
+            off += bytes_gate_sh_s;
+            if (!offset_ok(rt->file_size, off, bytes_up_sh_q)) die("moe up_sh_q out of bounds");
+            w->up_sh_q = (const int8_t *)(rt->data + off);
+            off += bytes_up_sh_q;
+            if (!offset_ok(rt->file_size, off, bytes_up_sh_s)) die("moe up_sh_s out of bounds");
+            w->up_sh_s = (const float *)(rt->data + off);
+            off += bytes_up_sh_s;
+            if (!offset_ok(rt->file_size, off, bytes_down_sh_q)) die("moe down_sh_q out of bounds");
+            w->down_sh_q = (const int8_t *)(rt->data + off);
+            off += bytes_down_sh_q;
+            if (!offset_ok(rt->file_size, off, bytes_down_sh_s)) die("moe down_sh_s out of bounds");
+            w->down_sh_s = (const float *)(rt->data + off);
+            off += bytes_down_sh_s;
+        }
+        rt->has_moe_shared = 1;
+        off_after_moe_shared = off;
+
+        // Optional routed experts block for MoE layers 1..n_layers-1.
+        if (off_after_moe_shared < rt->file_size) {
+            size_t bytes_gate_q = n_routed * moe_dim * dim * sizeof(int8_t);
+            size_t bytes_gate_s = n_routed * moe_dim * dim_groups_local * sizeof(float);
+            size_t bytes_up_q = n_routed * moe_dim * dim * sizeof(int8_t);
+            size_t bytes_up_s = n_routed * moe_dim * dim_groups_local * sizeof(float);
+            size_t bytes_down_q = n_routed * dim * moe_dim * sizeof(int8_t);
+            size_t bytes_down_s = n_routed * dim * moe_groups * sizeof(float);
+            size_t bytes_per_layer_routed = bytes_gate_q + bytes_gate_s + bytes_up_q + bytes_up_s + bytes_down_q + bytes_down_s;
+            size_t bytes_total_routed = bytes_per_layer_routed * n_moe_layers;
+            if (bytes_total_routed > rt->file_size - off_after_moe_shared) die("incomplete moe routed block");
+
+            rt->moe_routed_layers = (LayerMoeRouted *)calloc(n_layers, sizeof(LayerMoeRouted));
+            if (!rt->moe_routed_layers) die("out of memory");
+            off = off_after_moe_shared;
+            for (size_t li = 1; li < n_layers; li++) {
+                LayerMoeRouted *w = &rt->moe_routed_layers[li];
+                if (!offset_ok(rt->file_size, off, bytes_gate_q)) die("moe routed gate_q out of bounds");
+                w->gate_q = (const int8_t *)(rt->data + off);
+                off += bytes_gate_q;
+                if (!offset_ok(rt->file_size, off, bytes_gate_s)) die("moe routed gate_s out of bounds");
+                w->gate_s = (const float *)(rt->data + off);
+                off += bytes_gate_s;
+                if (!offset_ok(rt->file_size, off, bytes_up_q)) die("moe routed up_q out of bounds");
+                w->up_q = (const int8_t *)(rt->data + off);
+                off += bytes_up_q;
+                if (!offset_ok(rt->file_size, off, bytes_up_s)) die("moe routed up_s out of bounds");
+                w->up_s = (const float *)(rt->data + off);
+                off += bytes_up_s;
+                if (!offset_ok(rt->file_size, off, bytes_down_q)) die("moe routed down_q out of bounds");
+                w->down_q = (const int8_t *)(rt->data + off);
+                off += bytes_down_q;
+                if (!offset_ok(rt->file_size, off, bytes_down_s)) die("moe routed down_s out of bounds");
+                w->down_s = (const float *)(rt->data + off);
+                off += bytes_down_s;
+            }
+            rt->has_moe_routed = 1;
+        }
+    }
+}
+
+static void rmsnorm(float *o, const float *x, const float *w, int n) {
+    double ss = 0.0;
+    for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+    float mean = (float)(ss / (double)n);
+    float inv = 1.0f / sqrtf(mean + 1e-5f);
+    for (int i = 0; i < n; i++) o[i] = x[i] * inv * w[i];
+}
+
+static void dequant_row_q80(const int8_t *qrow, const float *srow, float *out, int dim, int gs) {
+    int n_groups = dim / gs;
+    for (int g = 0; g < n_groups; g++) {
+        float s = srow[g];
+        int base = g * gs;
+        for (int k = 0; k < gs; k++) {
+            out[base + k] = (float)qrow[base + k] * s;
+        }
+    }
+}
+
+static void matvec_q80_rows(const int8_t *qmat, const float *smat, const float *x, float *y, int rows, int dim, int gs) {
+    int n_groups = dim / gs;
+    for (int r = 0; r < rows; r++) {
+        const int8_t *qrow = qmat + (size_t)r * dim;
+        const float *srow = smat + (size_t)r * n_groups;
+        float acc = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            float s = srow[g];
+            int base = g * gs;
+            float dot = 0.0f;
+            for (int k = 0; k < gs; k++) dot += (float)qrow[base + k] * x[base + k];
+            acc += s * dot;
+        }
+        y[r] = acc;
+    }
+}
+
+static void runstate_init(RunState *s) {
+    memset(s, 0, sizeof(*s));
+}
+
+static void runstate_free(RunState *s) {
+    free(s->x);
+    free(s->xn);
+    free(s->xb);
+    free(s->ff_gate);
+    free(s->ff_up);
+    free(s->logits);
+    free(s->k_cache_comp);
+    free(s->k_cache_pe);
+    free(s->q_a);
+    free(s->q_full);
+    free(s->kv_a);
+    free(s->q_nope);
+    free(s->q_pe);
+    free(s->q_abs);
+    free(s->att_scores);
+    free(s->att_ctx);
+    free(s->att_concat);
+    free(s->moe_gate);
+    free(s->moe_up);
+    free(s->moe_router);
+    free(s->moe_out_acc);
+    free(s->moe_topk_idx);
+    free(s->moe_topk_w);
+    runstate_init(s);
+}
+
+static void runstate_build(RunState *s, const Runtime *rt, int cache_cap) {
+    runstate_init(s);
+    const RuntimeConfig *cfg = &rt->cfg;
+    s->x = (float *)calloc((size_t)cfg->dim, sizeof(float));
+    s->xn = (float *)calloc((size_t)cfg->dim, sizeof(float));
+    s->xb = (float *)calloc((size_t)cfg->dim, sizeof(float));
+    s->ff_gate = (float *)calloc((size_t)cfg->hidden_dim, sizeof(float));
+    s->ff_up = (float *)calloc((size_t)cfg->hidden_dim, sizeof(float));
+    s->logits = (float *)calloc((size_t)cfg->vocab_size, sizeof(float));
+    s->cache_cap = cache_cap;
+    s->n_attn_layers = rt->has_all_attn ? cfg->n_layers : (rt->has_l0_attn ? 1 : 0);
+
+    if (s->n_attn_layers > 0) {
+        s->k_cache_comp = (float *)calloc((size_t)s->n_attn_layers * (size_t)cache_cap * (size_t)cfg->kv_lora_rank, sizeof(float));
+        s->k_cache_pe = (float *)calloc((size_t)s->n_attn_layers * (size_t)cache_cap * (size_t)cfg->rope_dim, sizeof(float));
+        s->q_a = (float *)calloc((size_t)cfg->q_lora_rank, sizeof(float));
+        s->q_full = (float *)calloc((size_t)cfg->n_heads * (size_t)cfg->l0_head_k_dim, sizeof(float));
+        s->kv_a = (float *)calloc((size_t)(cfg->kv_lora_rank + cfg->rope_dim), sizeof(float));
+        s->q_nope = (float *)calloc((size_t)cfg->l0_qk_nope_dim, sizeof(float));
+        s->q_pe = (float *)calloc((size_t)cfg->rope_dim, sizeof(float));
+        s->q_abs = (float *)calloc((size_t)cfg->kv_lora_rank, sizeof(float));
+        s->att_scores = (float *)calloc((size_t)cache_cap, sizeof(float));
+        s->att_ctx = (float *)calloc((size_t)cfg->kv_lora_rank, sizeof(float));
+        s->att_concat = (float *)calloc((size_t)cfg->n_heads * (size_t)cfg->l0_v_head_dim, sizeof(float));
+    }
+    if (rt->has_moe_shared && cfg->moe_ffn_dim > 0) {
+        s->moe_gate = (float *)calloc((size_t)cfg->moe_ffn_dim, sizeof(float));
+        s->moe_up = (float *)calloc((size_t)cfg->moe_ffn_dim, sizeof(float));
+        s->moe_router = (float *)calloc((size_t)cfg->n_routed_experts, sizeof(float));
+        s->moe_out_acc = (float *)calloc((size_t)cfg->dim, sizeof(float));
+        s->moe_topk_idx = (int *)calloc((size_t)cfg->n_experts_used, sizeof(int));
+        s->moe_topk_w = (float *)calloc((size_t)cfg->n_experts_used, sizeof(float));
+    }
+
+    if (!s->x || !s->xn || !s->xb || !s->ff_gate || !s->ff_up || !s->logits ||
+        (s->n_attn_layers > 0 && (!s->k_cache_comp || !s->k_cache_pe || !s->q_a || !s->q_full || !s->kv_a ||
+                             !s->q_nope || !s->q_pe || !s->q_abs || !s->att_scores || !s->att_ctx || !s->att_concat)) ||
+        (rt->has_moe_shared && cfg->moe_ffn_dim > 0 &&
+         (!s->moe_gate || !s->moe_up || !s->moe_router || !s->moe_out_acc || !s->moe_topk_idx || !s->moe_topk_w))) {
+        die("out of memory");
+    }
+}
+
+static float silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+static float dot_f32(const float *a, const float *b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+static double sum_f32(const float *x, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)x[i];
+    return sum;
+}
+
+static void debug_print_tensor_sum(const char *name, const float *x, int n) {
+    if (!name || !x || n <= 0) return;
+    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(x, n));
+}
+
+static void softmax_inplace(float *x, int n) {
+    float maxv = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > maxv) maxv = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - maxv);
+        sum += x[i];
+    }
+    if (sum <= 0.0f) return;
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
+}
+
+static void apply_rope_inplace(float *x, int dim, int pos) {
+    const float base = 1000000.0f;
+    for (int i = 0; i + 1 < dim; i += 2) {
+        float freq = powf(base, -((float)i / (float)dim));
+        float ang = (float)pos * freq;
+        float c = cosf(ang);
+        float s = sinf(ang);
+        float x0 = x[i + 0];
+        float x1 = x[i + 1];
+        x[i + 0] = x0 * c - x1 * s;
+        x[i + 1] = x0 * s + x1 * c;
+    }
+}
+
+static void apply_mla_attention_layer(const Runtime *rt, const LayerAttnWeights *w, RunState *s, int gs, int pos, int layer_idx) {
+    if (!w) return;
+    if (pos < 0 || pos >= s->cache_cap) die("position exceeds attention cache capacity");
+    if (layer_idx < 0 || layer_idx >= s->n_attn_layers) die("invalid attention layer index");
+
+    const int dim = rt->cfg.dim;
+    const int n_heads = rt->cfg.n_heads;
+    const int q_lora = rt->cfg.q_lora_rank;
+    const int kv_lora = rt->cfg.kv_lora_rank;
+    const int rope_dim = rt->cfg.rope_dim;
+    const int qk_nope = rt->cfg.l0_qk_nope_dim;
+    const int head_k = rt->cfg.l0_head_k_dim;
+    const int v_head = rt->cfg.l0_v_head_dim;
+    const float kq_scale = 1.0f / sqrtf((float)head_k);
+
+    rmsnorm(s->xn, s->x, w->attn_norm, dim);
+
+    matvec_q80_rows(w->q_a_q, w->q_a_s, s->xn, s->q_a, q_lora, dim, gs);
+    rmsnorm(s->q_a, s->q_a, w->q_a_norm, q_lora);
+    matvec_q80_rows(w->q_b_q, w->q_b_s, s->q_a, s->q_full, n_heads * head_k, q_lora, gs);
+
+    matvec_q80_rows(w->kv_a_q, w->kv_a_s, s->xn, s->kv_a, kv_lora + rope_dim, dim, gs);
+    rmsnorm(s->kv_a, s->kv_a, w->kv_a_norm, kv_lora);
+
+    size_t layer_base = (size_t)layer_idx * (size_t)s->cache_cap;
+    float *cache_comp = s->k_cache_comp + (layer_base + (size_t)pos) * (size_t)kv_lora;
+    float *cache_pe = s->k_cache_pe + (layer_base + (size_t)pos) * (size_t)rope_dim;
+    memcpy(cache_comp, s->kv_a, (size_t)kv_lora * sizeof(float));
+    memcpy(cache_pe, s->kv_a + kv_lora, (size_t)rope_dim * sizeof(float));
+    apply_rope_inplace(cache_pe, rope_dim, pos);
+
+    for (int h = 0; h < n_heads; h++) {
+        const float *qh = s->q_full + (size_t)h * (size_t)head_k;
+        memcpy(s->q_nope, qh, (size_t)qk_nope * sizeof(float));
+        memcpy(s->q_pe, qh + qk_nope, (size_t)rope_dim * sizeof(float));
+        apply_rope_inplace(s->q_pe, rope_dim, pos);
+
+        const int8_t *k_b_q_h = w->k_b_q + (size_t)h * (size_t)kv_lora * (size_t)qk_nope;
+        const float *k_b_s_h = w->k_b_s + (size_t)h * (size_t)kv_lora * (size_t)(qk_nope / gs);
+        matvec_q80_rows(k_b_q_h, k_b_s_h, s->q_nope, s->q_abs, kv_lora, qk_nope, gs);
+
+        for (int t = 0; t <= pos; t++) {
+            const float *kc = s->k_cache_comp + (layer_base + (size_t)t) * (size_t)kv_lora;
+            const float *kp = s->k_cache_pe + (layer_base + (size_t)t) * (size_t)rope_dim;
+            float score = dot_f32(s->q_abs, kc, kv_lora) + dot_f32(s->q_pe, kp, rope_dim);
+            s->att_scores[t] = score * kq_scale;
+        }
+        softmax_inplace(s->att_scores, pos + 1);
+
+        memset(s->att_ctx, 0, (size_t)kv_lora * sizeof(float));
+        for (int t = 0; t <= pos; t++) {
+            const float *kc = s->k_cache_comp + (layer_base + (size_t)t) * (size_t)kv_lora;
+            float p = s->att_scores[t];
+            for (int i = 0; i < kv_lora; i++) s->att_ctx[i] += p * kc[i];
+        }
+
+        const int8_t *v_b_q_h = w->v_b_q + (size_t)h * (size_t)v_head * (size_t)kv_lora;
+        const float *v_b_s_h = w->v_b_s + (size_t)h * (size_t)v_head * (size_t)(kv_lora / gs);
+        matvec_q80_rows(v_b_q_h, v_b_s_h, s->att_ctx, s->att_concat + (size_t)h * (size_t)v_head, v_head, kv_lora, gs);
+    }
+
+    matvec_q80_rows(w->attn_out_q, w->attn_out_s, s->att_concat, s->xb, dim, n_heads * v_head, gs);
+    for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
+}
+
+static void apply_l0_dense_ffn(const Runtime *rt, RunState *s, int gs) {
+    if (!rt->has_l0_ffn) return;
+    rmsnorm(s->xn, s->x, rt->l0_ffn_norm, rt->cfg.dim);
+    matvec_q80_rows(rt->l0_ffn_gate_q, rt->l0_ffn_gate_s, s->xn, s->ff_gate, rt->cfg.hidden_dim, rt->cfg.dim, gs);
+    matvec_q80_rows(rt->l0_ffn_up_q, rt->l0_ffn_up_s, s->xn, s->ff_up, rt->cfg.hidden_dim, rt->cfg.dim, gs);
+    for (int i = 0; i < rt->cfg.hidden_dim; i++) {
+        s->ff_gate[i] = silu(s->ff_gate[i]) * s->ff_up[i];
+    }
+    matvec_q80_rows(rt->l0_ffn_down_q, rt->l0_ffn_down_s, s->ff_gate, s->xb, rt->cfg.dim, rt->cfg.hidden_dim, gs);
+    for (int i = 0; i < rt->cfg.dim; i++) {
+        s->x[i] += s->xb[i];
+    }
+}
+
+static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, int layer_idx) {
+    if (!rt->has_moe_shared) return;
+    if (layer_idx <= 0 || layer_idx >= rt->cfg.n_layers) return;
+    if (rt->cfg.moe_ffn_dim <= 0) return;
+    const LayerMoeShared *w = &rt->moe_layers[layer_idx];
+    if (!w->ffn_norm) return;
+
+    const int dim = rt->cfg.dim;
+    const int moe_dim = rt->cfg.moe_ffn_dim;
+    const int n_routed = rt->cfg.n_routed_experts;
+
+    rmsnorm(s->xn, s->x, w->ffn_norm, dim);
+
+    // Router probabilities for routed experts. For DeepSeek2, expert selection uses
+    // probs + exp_probs_b, but expert weights themselves remain unbiased probs.
+    for (int e = 0; e < n_routed; e++) {
+        const float *gw = w->gate_inp + (size_t)e * (size_t)dim;
+        float logit = dot_f32(gw, s->xn, dim);
+        s->moe_router[e] = 1.0f / (1.0f + expf(-logit)); // sigmoid gating
+    }
+
+    // Select top-k experts.
+    const int top_k = rt->cfg.n_experts_used;
+    for (int k = 0; k < top_k; k++) {
+        s->moe_topk_idx[k] = -1;
+        s->moe_topk_w[k] = -1e30f;
+    }
+    for (int e = 0; e < n_routed; e++) {
+        float p = s->moe_router[e];
+        float sel = p + w->exp_probs_b[e];
+        int pos = -1;
+        for (int k = 0; k < top_k; k++) {
+            int idx = s->moe_topk_idx[k];
+            float cur_sel = (idx >= 0) ? (s->moe_router[idx] + w->exp_probs_b[idx]) : -INFINITY;
+            if (sel > cur_sel) {
+                pos = k;
+                break;
+            }
+        }
+        if (pos < 0) continue;
+        for (int k = top_k - 1; k > pos; k--) {
+            s->moe_topk_idx[k] = s->moe_topk_idx[k - 1];
+            s->moe_topk_w[k] = s->moe_topk_w[k - 1];
+        }
+        s->moe_topk_idx[pos] = e;
+        s->moe_topk_w[pos] = p;
+    }
+    float top_sum = 0.0f;
+    for (int k = 0; k < top_k; k++) {
+        if (s->moe_topk_idx[k] >= 0) top_sum += s->moe_topk_w[k];
+    }
+    if (top_sum > 0.0f) {
+        float inv = 1.0f / top_sum;
+        for (int k = 0; k < top_k; k++) s->moe_topk_w[k] *= inv;
+    }
+
+    memset(s->moe_out_acc, 0, (size_t)dim * sizeof(float));
+    int disable_moe_routed = 0;
+    const char *disable_moe_routed_env = getenv("GLM_DISABLE_MOE_ROUTED");
+    if (disable_moe_routed_env && disable_moe_routed_env[0] && disable_moe_routed_env[0] != '0') {
+        disable_moe_routed = 1;
+    }
+    if (!disable_moe_routed && rt->has_moe_routed && rt->moe_routed_layers) {
+        const LayerMoeRouted *rw = &rt->moe_routed_layers[layer_idx];
+        if (rw->gate_q && rw->gate_s && rw->up_q && rw->up_s && rw->down_q && rw->down_s) {
+            const int dim_groups = dim / gs;
+            const int moe_groups = moe_dim / gs;
+            const float routed_scale = 1.8f;
+            for (int k = 0; k < top_k; k++) {
+                int e = s->moe_topk_idx[k];
+                if (e < 0) continue;
+                float w_e = s->moe_topk_w[k] * routed_scale;
+
+                const int8_t *gq = rw->gate_q + (size_t)e * (size_t)moe_dim * (size_t)dim;
+                const float *gsr = rw->gate_s + (size_t)e * (size_t)moe_dim * (size_t)dim_groups;
+                const int8_t *uq = rw->up_q + (size_t)e * (size_t)moe_dim * (size_t)dim;
+                const float *usr = rw->up_s + (size_t)e * (size_t)moe_dim * (size_t)dim_groups;
+                const int8_t *dq = rw->down_q + (size_t)e * (size_t)dim * (size_t)moe_dim;
+                const float *dsr = rw->down_s + (size_t)e * (size_t)dim * (size_t)moe_groups;
+
+                matvec_q80_rows(gq, gsr, s->xn, s->moe_gate, moe_dim, dim, gs);
+                matvec_q80_rows(uq, usr, s->xn, s->moe_up, moe_dim, dim, gs);
+                for (int i = 0; i < moe_dim; i++) s->moe_gate[i] = silu(s->moe_gate[i]) * s->moe_up[i];
+                matvec_q80_rows(dq, dsr, s->moe_gate, s->xb, dim, moe_dim, gs);
+                for (int i = 0; i < dim; i++) s->moe_out_acc[i] += w_e * s->xb[i];
+            }
+        }
+    }
+
+    matvec_q80_rows(w->gate_sh_q, w->gate_sh_s, s->xn, s->moe_gate, moe_dim, dim, gs);
+    matvec_q80_rows(w->up_sh_q, w->up_sh_s, s->xn, s->moe_up, moe_dim, dim, gs);
+    for (int i = 0; i < moe_dim; i++) {
+        s->moe_gate[i] = silu(s->moe_gate[i]) * s->moe_up[i];
+    }
+    matvec_q80_rows(w->down_sh_q, w->down_sh_s, s->moe_gate, s->xb, dim, moe_dim, gs);
+    for (int i = 0; i < dim; i++) {
+        s->x[i] += s->xb[i] + s->moe_out_acc[i];
+    }
+}
+
+static int argmax(const float *x, int n) {
+    int idx = 0;
+    float best = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > best) {
+            best = x[i];
+            idx = i;
+        }
+    }
+    return idx;
+}
+
+static int sample_logits_temperature(const float *logits, int n, float temperature) {
+    if (temperature <= 0.0f) return argmax(logits, n);
+
+    float max_logit = logits[0];
+    for (int i = 1; i < n; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+
+    const double inv_temp = 1.0 / (double)temperature;
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum += exp(((double)logits[i] - (double)max_logit) * inv_temp);
+    }
+    if (!(sum > 0.0) || !isfinite(sum)) return argmax(logits, n);
+
+    const double r = ((double)rand() / ((double)RAND_MAX + 1.0)) * sum;
+    double cdf = 0.0;
+    for (int i = 0; i < n; i++) {
+        cdf += exp(((double)logits[i] - (double)max_logit) * inv_temp);
+        if (cdf >= r) return i;
+    }
+    return n - 1;
+}
+
+static void debug_print_prompt_embd_batch(const Runtime *rt, const int *prompt_ids, int n_prompt) {
+    if (n_prompt <= 0) return;
+
+    const int dim = rt->cfg.dim;
+    const int gs = (int)rt->cfg.group_size;
+    const int n_groups = dim / gs;
+    const int head_vals = dim < 8 ? dim : 8;
+    const int head_rows = n_prompt < 4 ? n_prompt : 4;
+
+    float *row = (float *)malloc((size_t)dim * sizeof(float));
+    if (!row) die("out of memory");
+
+    double sum = 0.0;
+    fprintf(stderr,
+            "[glm-debug-callback] embd = (f32) GET_ROWS(token_embd.weight{%d, %d, 1, 1}, inp_tokens{%d, 1, 1, 1}) = {%d, %d, 1, 1}\n",
+            dim, rt->cfg.vocab_size, n_prompt, dim, n_prompt);
+
+    for (int t = 0; t < n_prompt; t++) {
+        int tok = prompt_ids[t];
+        if (tok < 0 || tok >= rt->cfg.vocab_size) tok = 0;
+        const int8_t *eq = rt->tok_q + (size_t)tok * (size_t)dim;
+        const float *es = rt->tok_s + (size_t)tok * (size_t)n_groups;
+        dequant_row_q80(eq, es, row, dim, gs);
+
+        for (int i = 0; i < dim; i++) sum += row[i];
+
+        if (t < head_rows) {
+            fprintf(stderr, "[glm-debug-callback]   token[%d]=%d row_head:", t, tok);
+            for (int i = 0; i < head_vals; i++) {
+                fprintf(stderr, " %.4f", row[i]);
+            }
+            if (dim > head_vals) fprintf(stderr, " ...");
+            fprintf(stderr, "\n");
+        }
+    }
+    if (n_prompt > head_rows) {
+        fprintf(stderr, "[glm-debug-callback]   ... (%d more tokens)\n", n_prompt - head_rows);
+    }
+    fprintf(stderr, "[glm-debug-callback]   sum = %.6f\n", sum);
+
+    free(row);
+}
+
+static void print_token_safe(const Token *t) {
+    if (!t || !t->bytes || t->len == 0) return;
+    for (uint32_t i = 0; i < t->len; i++) {
+        unsigned char c = (unsigned char)t->bytes[i];
+        if (isprint(c) || c == '\n' || c == '\t' || c == ' ') putchar((int)c);
+        else putchar(' ');
+    }
+}
+
+static int lookup_token_id(const Tokenizer *tok, const char *bytes, uint32_t len) {
+    if (len == 1) {
+        int id = tok->ascii_map[(unsigned char)bytes[0]];
+        if (id >= 0 && tok->tokens[id].len == 1 && tok->tokens[id].bytes[0] == bytes[0]) return id;
+    }
+    for (size_t i = 0; i < tok->n_tokens; i++) {
+        if (tok->tokens[i].len != len) continue;
+        if (len == 0) continue;
+        if (memcmp(tok->tokens[i].bytes, bytes, len) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids, int max_ids, int bos) {
+    if (max_ids <= 0) return 0;
+
+    int n = 0;
+    if (bos >= 0 && n < max_ids) ids[n++] = bos;
+    if (!prompt || prompt[0] == '\0') return n;
+
+    const unsigned char *p = (const unsigned char *)prompt;
+    while (*p && n < max_ids) {
+        int id = -1;
+        int consumed = 1;
+
+        // Special-token path: "<...>" up to 64 bytes.
+        if (*p == '<') {
+            int end = -1;
+            for (int k = 0; p[k] != '\0' && k < 64; k++) {
+                if (p[k] == '>') {
+                    end = k;
+                    break;
+                }
+            }
+            if (end >= 0) {
+                uint32_t slen = (uint32_t)(end + 1);
+                id = lookup_token_id(tok, (const char *)p, slen);
+                if (id >= 0) consumed = end + 1;
+            }
+        }
+
+        if (id < 0) {
+            char b = (char)(*p);
+            id = lookup_token_id(tok, &b, 1);
+        }
+
+        if (id >= 0 && n < max_ids) ids[n++] = id;
+        p += consumed;
+    }
+
+    // Greedy BPE merges by merge score.
+    char *merge_buf = (char *)malloc((size_t)tok->max_token_len * 2u + 4u);
+    if (!merge_buf) die("out of memory");
+    while (1) {
+        float best = -1e30f;
+        int best_id = -1;
+        int best_idx = -1;
+
+        for (int i = 0; i < n - 1; i++) {
+            int a = ids[i];
+            int b = ids[i + 1];
+            if (a < 0 || b < 0 || a >= (int)tok->n_tokens || b >= (int)tok->n_tokens) continue;
+            uint32_t la = tok->tokens[a].len;
+            uint32_t lb = tok->tokens[b].len;
+            uint32_t l = la + lb;
+            if (l == 0) continue;
+            memcpy(merge_buf, tok->tokens[a].bytes, la);
+            memcpy(merge_buf + la, tok->tokens[b].bytes, lb);
+            int merged = lookup_token_id(tok, merge_buf, l);
+            if (merged >= 0 && tok->scores[merged] > best) {
+                best = tok->scores[merged];
+                best_id = merged;
+                best_idx = i;
+            }
+        }
+
+        if (best_idx < 0) break;
+        ids[best_idx] = best_id;
+        for (int i = best_idx + 1; i < n - 1; i++) ids[i] = ids[i + 1];
+        n--;
+    }
+    free(merge_buf);
+    return n;
+}
+
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--debug] [--self-test-tokenizer]\n", prog);
+}
+
+static char *read_text_file_alloc(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long n = ftell(f);
+    if (n < 0) {
+        fclose(f);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    size_t size = (size_t)n;
+    char *buf = (char *)malloc(size + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, size, f);
+    fclose(f);
+    if (got != size) {
+        free(buf);
+        return NULL;
+    }
+    buf[size] = '\0';
+    return buf;
+}
+
+static void assert_finite_slice(const char *name, const float *x, int n, int debug_mode) {
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(x[i])) {
+            fprintf(stderr, "[error] non-finite value in %s at i=%d: %f\n", name, i, x[i]);
+            die("numerical sanity check failed");
+        }
+    }
+    if (debug_mode) {
+        float minv = x[0], maxv = x[0], sum = 0.0f;
+        for (int i = 0; i < n; i++) {
+            if (x[i] < minv) minv = x[i];
+            if (x[i] > maxv) maxv = x[i];
+            sum += x[i];
+        }
+        fprintf(stderr, "[debug] %s stats: min=%.6f max=%.6f mean=%.6f\n", name, minv, maxv, sum / (float)n);
+    }
+}
+
+static int tokenizer_roundtrip_check(const Tokenizer *tok, const char *text, int bos_id) {
+    int ids[2048];
+    int n = encode_prompt_bpe(tok, text, ids, (int)(sizeof(ids) / sizeof(ids[0])), bos_id);
+    if (n <= 0) return 0;
+
+    char out[8192];
+    size_t out_n = 0;
+    int start = 0;
+    if (n > 0 && ids[0] == bos_id) start = 1;
+
+    for (int i = start; i < n; i++) {
+        int id = ids[i];
+        if (id < 0 || id >= (int)tok->n_tokens) return 0;
+        const Token *t = &tok->tokens[id];
+        if (out_n + t->len >= sizeof(out)) return 0;
+        memcpy(out + out_n, t->bytes, t->len);
+        out_n += t->len;
+    }
+    out[out_n] = '\0';
+    return strcmp(out, text) == 0;
+}
+
+static int run_tokenizer_self_test(const Tokenizer *tok, int bos_id) {
+    const char *cases[] = {
+        "1+1=",
+        "abc123",
+        "sum(2,3)",
+        "z=",
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int pass = tokenizer_roundtrip_check(tok, cases[i], bos_id);
+        fprintf(stderr, "[tokenizer-selftest] \"%s\" -> %s\n", cases[i], pass ? "PASS" : "FAIL");
+        if (!pass) ok = 0;
+    }
+    return ok;
+}
+
+static void print_topk_debug(const float *logits, const Tokenizer *tok, int vocab_size, int k) {
+    if (k <= 0) return;
+    int *idx = (int *)calloc((size_t)k, sizeof(int));
+    float *val = (float *)calloc((size_t)k, sizeof(float));
+    if (!idx || !val) die("out of memory");
+    for (int i = 0; i < k; i++) {
+        idx[i] = -1;
+        val[i] = -INFINITY;
+    }
+
+    for (int i = 0; i < vocab_size; i++) {
+        float x = logits[i];
+        int pos = -1;
+        for (int j = 0; j < k; j++) {
+            if (x > val[j]) {
+                pos = j;
+                break;
+            }
+        }
+        if (pos < 0) continue;
+        for (int j = k - 1; j > pos; j--) {
+            val[j] = val[j - 1];
+            idx[j] = idx[j - 1];
+        }
+        val[pos] = x;
+        idx[pos] = i;
+    }
+
+    fprintf(stderr, "[debug] top-%d logits:\n", k);
+    for (int i = 0; i < k; i++) {
+        if (idx[i] < 0) continue;
+        fprintf(stderr, "  #%d id=%d logit=%.6f token=\"", i + 1, idx[i], val[i]);
+        const Token *t = &tok->tokens[idx[i]];
+        for (uint32_t j = 0; j < t->len; j++) {
+            unsigned char c = (unsigned char)t->bytes[j];
+            if (isprint(c) && c != '"') fputc((int)c, stderr);
+            else fputc(' ', stderr);
+        }
+        fprintf(stderr, "\"\n");
+    }
+
+    free(idx);
+    free(val);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    const char *checkpoint = argv[1];
+    int n_tokens = 16;
+    const char *prompt = "";
+    const char *prompt_path = NULL;
+    const char *mode = "completion";
+    int context_limit = 0;
+    float temperature = 0.0f;
+    int seed = -1;
+    int debug_mode = 0;
+    int self_test_tokenizer = 0;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) prompt = argv[++i];
+        else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) prompt_path = argv[++i];
+        else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) mode = argv[++i];
+        else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) context_limit = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) temperature = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--debug") == 0) debug_mode = 1;
+        else if (strcmp(argv[i], "--self-test-tokenizer") == 0) self_test_tokenizer = 1;
+        else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+    if (temperature < 0.0f) {
+        fprintf(stderr, "Error: temperature must be >= 0.\n");
+        return 1;
+    }
+    if (context_limit < 0) {
+        fprintf(stderr, "Error: context limit must be >= 0.\n");
+        return 1;
+    }
+    if (prompt[0] != '\0' && prompt_path != NULL) {
+        fprintf(stderr, "Error: use only one of -i or -f.\n");
+        usage(argv[0]);
+        return 1;
+    }
+
+    Runtime rt;
+    runtime_open(&rt, checkpoint);
+
+    Tokenizer tok;
+    load_tokenizer(checkpoint, &tok, rt.cfg.vocab_size);
+
+    printf("[glm4.7-flash] loaded checkpoint\n");
+    printf("  dim=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d\n",
+           rt.cfg.dim, rt.cfg.n_layers, rt.cfg.n_heads, rt.cfg.n_kv_heads, rt.cfg.vocab_size, rt.cfg.seq_len);
+    printf("  mode=%s version=%u\n", mode, rt.cfg.version);
+    const char *attn_tag = rt.has_all_attn ? "+mla_attn_all" : (rt.has_l0_attn ? "+l0_mla_attn" : "");
+    printf("  forward=embed%s%s%s%s+final_norm+lm_head\n",
+           attn_tag,
+           rt.has_l0_ffn ? "+l0_dense_ffn" : "",
+           rt.has_moe_shared ? "+moe_shared_ffn" : "",
+           rt.has_moe_routed ? "+moe_routed" : "");
+    printf("  blocks: l0_attn=%s all_attn=%s l0_ffn=%s moe_shared=%s moe_routed=%s native_coverage=%s\n",
+           rt.has_l0_attn ? "on" : "off",
+           rt.has_all_attn ? "on" : "off",
+           rt.has_l0_ffn ? "on" : "off",
+           rt.has_moe_shared ? "on" : "off",
+           rt.has_moe_routed ? "on" : "off",
+           (rt.cfg.l0_flags & 2) ? "full" : "partial");
+    printf("  attn_layers_active=%d\n", rt.has_all_attn ? rt.cfg.n_layers : (rt.has_l0_attn ? 1 : 0));
+
+    if (self_test_tokenizer) {
+        int pass = run_tokenizer_self_test(&tok, rt.cfg.bos_id);
+        tokenizer_free(&tok);
+        runtime_close(&rt);
+        return pass ? 0 : 2;
+    }
+
+    unsigned int rng_seed = (seed >= 0) ? (unsigned int)seed : ((unsigned int)getpid() ^ (unsigned int)n_tokens);
+    srand(rng_seed);
+    if (debug_mode) {
+        fprintf(stderr, "[debug] sampler: temperature=%.6f seed=%u\n", temperature, rng_seed);
+    }
+
+    char *prompt_file_buf = NULL;
+    if (prompt_path != NULL) {
+        prompt_file_buf = read_text_file_alloc(prompt_path);
+        if (!prompt_file_buf) {
+            fprintf(stderr, "Error: failed to read prompt file: %s\n", prompt_path);
+            tokenizer_free(&tok);
+            runtime_close(&rt);
+            return 1;
+        }
+        prompt = prompt_file_buf;
+    }
+
+    char input[PROMPT_BUFFER_SIZE];
+    char rendered_prompt[PROMPT_BUFFER_SIZE];
+    char prompt_template[PROMPT_BUFFER_SIZE];
+    if (strcmp(mode, "chat") == 0 && strlen(prompt) == 0) {
+        printf("chat> ");
+        fflush(stdout);
+        if (!fgets(input, sizeof(input), stdin)) {
+            free(prompt_file_buf);
+            tokenizer_free(&tok);
+            runtime_close(&rt);
+            return 0;
+        }
+        if (load_template_text(checkpoint, ".template", prompt_template, sizeof(prompt_template))) {
+            if (strstr(prompt_template, "{{") != NULL || strstr(prompt_template, "{%") != NULL) {
+                snprintf(prompt_template, sizeof(prompt_template), "<|user|>\n%%s\n<|assistant|>\n");
+            }
+            render_template_user(prompt_template, input, rendered_prompt, sizeof(rendered_prompt));
+            prompt = rendered_prompt;
+        } else {
+            prompt = input;
+        }
+    }
+
+    if (strlen(prompt) > 0) {
+        printf("%s", prompt);
+        if (prompt[strlen(prompt) - 1] != '\n') putchar('\n');
+    }
+
+    int *prompt_ids = (int *)calloc((size_t)PROMPT_BUFFER_SIZE, sizeof(int));
+    if (!prompt_ids) die("out of memory");
+    // Completion prompts in GGUF tools are tokenized without implicit BOS.
+    int prompt_bos = (strcmp(mode, "chat") == 0) ? rt.cfg.bos_id : -1;
+    int n_prompt = encode_prompt_bpe(&tok, prompt, prompt_ids, PROMPT_BUFFER_SIZE, prompt_bos);
+    if (n_prompt <= 0) n_prompt = encode_prompt_bpe(&tok, "", prompt_ids, PROMPT_BUFFER_SIZE, prompt_bos);
+    if (n_prompt <= 0) {
+        prompt_ids[0] = (rt.cfg.bos_id >= 0 && rt.cfg.bos_id < rt.cfg.vocab_size) ? rt.cfg.bos_id : 0;
+        n_prompt = 1;
+    }
+    if (debug_mode) {
+        fprintf(stderr, "[debug] prompt_ids (%d):", n_prompt);
+        int show = n_prompt < 12 ? n_prompt : 12;
+        for (int i = 0; i < show; i++) fprintf(stderr, " %d", prompt_ids[i]);
+        if (n_prompt > show) fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
+        debug_print_prompt_embd_batch(&rt, prompt_ids, n_prompt);
+    }
+
+    int cache_cap = n_prompt + n_tokens + 8;
+    if (cache_cap < 1) cache_cap = 1;
+    if (cache_cap > rt.cfg.seq_len) cache_cap = rt.cfg.seq_len;
+    if (cache_cap > PROMPT_BUFFER_SIZE) cache_cap = PROMPT_BUFFER_SIZE;
+    if (context_limit > 0 && cache_cap > context_limit) cache_cap = context_limit;
+    if (cache_cap < n_prompt) cache_cap = n_prompt;
+
+    RunState st;
+    runstate_build(&st, &rt, cache_cap);
+
+    int token = prompt_ids[0];
+    if (token < 0 || token >= rt.cfg.vocab_size) token = 0;
+    int prompt_index = 1;
+    int generated = 0;
+    LayerAttnWeights l0_attn_weights = {
+        .attn_norm = rt.l0_attn_norm,
+        .q_a_norm = rt.l0_q_a_norm,
+        .kv_a_norm = rt.l0_kv_a_norm,
+        .q_a_q = rt.l0_q_a_q,
+        .q_a_s = rt.l0_q_a_s,
+        .q_b_q = rt.l0_q_b_q,
+        .q_b_s = rt.l0_q_b_s,
+        .kv_a_q = rt.l0_kv_a_q,
+        .kv_a_s = rt.l0_kv_a_s,
+        .k_b_q = rt.l0_k_b_q,
+        .k_b_s = rt.l0_k_b_s,
+        .v_b_q = rt.l0_v_b_q,
+        .v_b_s = rt.l0_v_b_s,
+        .attn_out_q = rt.l0_attn_out_q,
+        .attn_out_s = rt.l0_attn_out_s,
+    };
+
+    int gs = (int)rt.cfg.group_size;
+    int n_groups = rt.cfg.dim / gs;
+    for (int pos = 0; pos < cache_cap; pos++) {
+        const int8_t *eq = rt.tok_q + (size_t)token * rt.cfg.dim;
+        const float *es = rt.tok_s + (size_t)token * n_groups;
+        dequant_row_q80(eq, es, st.x, rt.cfg.dim, gs);
+        assert_finite_slice("embed", st.x, rt.cfg.dim, 0);
+        if (debug_mode && pos == 0) {
+            debug_print_tensor_sum("embd", st.x, rt.cfg.dim);
+        }
+
+        if (rt.has_all_attn) {
+            for (int l = 0; l < rt.cfg.n_layers; l++) {
+                apply_mla_attention_layer(&rt, &rt.attn_layers[l], &st, gs, pos, l);
+                if (l == 0) apply_l0_dense_ffn(&rt, &st, gs);
+                else apply_moe_shared_ffn_layer(&rt, &st, gs, l);
+                if (debug_mode && pos == 0) {
+                    char name[32];
+                    snprintf(name, sizeof(name), "l_out-%d", l);
+                    debug_print_tensor_sum(name, st.x, rt.cfg.dim);
+                }
+            }
+            assert_finite_slice("attn_stack_out", st.x, rt.cfg.dim, 0);
+        } else if (rt.has_l0_attn) {
+            apply_mla_attention_layer(&rt, &l0_attn_weights, &st, gs, pos, 0);
+            assert_finite_slice("l0_attn_out", st.x, rt.cfg.dim, 0);
+            apply_l0_dense_ffn(&rt, &st, gs);
+            if (debug_mode && pos == 0) {
+                debug_print_tensor_sum("l_out-0", st.x, rt.cfg.dim);
+            }
+        } else {
+            apply_l0_dense_ffn(&rt, &st, gs);
+            if (debug_mode && pos == 0) {
+                debug_print_tensor_sum("l_out-0", st.x, rt.cfg.dim);
+            }
+        }
+        if (rt.has_l0_ffn) assert_finite_slice("l0_ffn_out", st.x, rt.cfg.dim, 0);
+        rmsnorm(st.xn, st.x, rt.output_norm, rt.cfg.dim);
+        assert_finite_slice("final_rmsnorm", st.xn, rt.cfg.dim, 0);
+        if (debug_mode && pos == 0) {
+            debug_print_tensor_sum("result_norm", st.xn, rt.cfg.dim);
+        }
+        matvec_q80_rows(rt.out_q, rt.out_s, st.xn, st.logits, rt.cfg.vocab_size, rt.cfg.dim, gs);
+        assert_finite_slice("logits", st.logits, rt.cfg.vocab_size, 0);
+        if (debug_mode && pos == 0) {
+            debug_print_tensor_sum("result_output", st.logits, rt.cfg.vocab_size);
+        }
+        if (debug_mode && prompt_index >= n_prompt && generated == 0) {
+            print_topk_debug(st.logits, &tok, rt.cfg.vocab_size, 5);
+        }
+
+        int next = -1;
+        if (prompt_index < n_prompt) {
+            next = prompt_ids[prompt_index++];
+            if (next < 0 || next >= rt.cfg.vocab_size) next = 0;
+        } else {
+            next = sample_logits_temperature(st.logits, rt.cfg.vocab_size, temperature);
+            if (next == rt.cfg.bos_id && rt.cfg.vocab_size > 1) next = (next + 1) % rt.cfg.vocab_size;
+            if (next == rt.cfg.eos_id) break;
+            print_token_safe(&tok.tokens[next]);
+            generated++;
+            if (generated >= n_tokens) break;
+        }
+        token = next;
+    }
+    putchar('\n');
+
+    free(prompt_ids);
+    free(prompt_file_buf);
+    runstate_free(&st);
+    tokenizer_free(&tok);
+    runtime_close(&rt);
+    return 0;
+}
