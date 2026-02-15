@@ -3,9 +3,9 @@
 
 Current scope:
 - Exports real tensors for a baseline path:
-  - token_embd.weight (Q8_0 runtime)
+  - token_embd.weight (runtime Q8 path)
   - output_norm.weight (fp32)
-  - output.weight (Q8_0 runtime)
+  - output.weight (runtime Q8 path)
   - layer-0 MLA attention (attn_norm/q_a/q_a_norm/q_b/kv_a_mqa/kv_a_norm/k_b/v_b/attn_output)
   - layer-0 dense FFN (ffn_norm/gate/up/down)
 - Appends per-layer MLA attention blocks for all layers (for future full-layer runtime loop).
@@ -81,7 +81,9 @@ def get_cfg(reader: GGUFReader) -> Config:
     if arch != "deepseek2":
         raise ValueError(f"unexpected architecture {arch!r}, expected 'deepseek2'")
 
-    vocab_field = first_present(reader, ["deepseek2.vocab_size", "tokenizer.ggml.tokens"], 0)
+    vocab_field = first_present(
+        reader, ["deepseek2.vocab_size", "tokenizer.ggml.tokens"], 0
+    )
     vocab_size = len(vocab_field) if isinstance(vocab_field, list) else int(vocab_field)
 
     return Config(
@@ -156,13 +158,23 @@ def quantize_q80_rows(rows: np.ndarray, group_size: int = GROUP_SIZE):
     if rows.dtype != np.float32:
         rows = rows.astype(np.float32, copy=False)
     if rows.shape[1] % group_size != 0:
-        raise ValueError(f"row width {rows.shape[1]} is not divisible by group size {group_size}")
+        raise ValueError(
+            f"row width {rows.shape[1]} is not divisible by group size {group_size}"
+        )
 
     r = rows.reshape(rows.shape[0], -1, group_size)
     wmax = np.max(np.abs(r), axis=2)
     scale = np.where(wmax == 0.0, 1.0, wmax / 127.0).astype(np.float32)
     q = np.round(r / scale[:, :, None]).clip(-127, 127).astype(np.int8)
     return q.reshape(rows.shape[0], rows.shape[1]), scale
+
+
+def pack_runtime_rows(tensor, rows: np.ndarray, group_size: int = GROUP_SIZE):
+    del tensor
+    rows = rows.astype(np.float32, copy=False)
+    if rows.ndim != 2:
+        raise ValueError(f"expected 2D rows, got shape {rows.shape}")
+    return quantize_q80_rows(rows, group_size=group_size)
 
 
 def prepare_layer_attention_quantized(
@@ -172,25 +184,43 @@ def prepare_layer_attention_quantized(
     expected_dims: Optional[Tuple[int, int, int]] = None,
 ):
     pfx = f"blk.{layer_idx}"
-    attn_norm = dequantize(tm[f"{pfx}.attn_norm.weight"].data, tm[f"{pfx}.attn_norm.weight"].tensor_type).astype(np.float32)
-    q_a_norm = dequantize(tm[f"{pfx}.attn_q_a_norm.weight"].data, tm[f"{pfx}.attn_q_a_norm.weight"].tensor_type).astype(np.float32)
-    kv_a_norm = dequantize(tm[f"{pfx}.attn_kv_a_norm.weight"].data, tm[f"{pfx}.attn_kv_a_norm.weight"].tensor_type).astype(np.float32)
+    attn_norm_t = tm[f"{pfx}.attn_norm.weight"]
+    q_a_norm_t = tm[f"{pfx}.attn_q_a_norm.weight"]
+    kv_a_norm_t = tm[f"{pfx}.attn_kv_a_norm.weight"]
+    q_a_t = tm[f"{pfx}.attn_q_a.weight"]
+    q_b_t = tm[f"{pfx}.attn_q_b.weight"]
+    kv_a_t = tm[f"{pfx}.attn_kv_a_mqa.weight"]
+    k_b_t = tm[f"{pfx}.attn_k_b.weight"]
+    v_b_t = tm[f"{pfx}.attn_v_b.weight"]
+    attn_out_t = tm[f"{pfx}.attn_output.weight"]
 
-    q_a = dequantize(tm[f"{pfx}.attn_q_a.weight"].data, tm[f"{pfx}.attn_q_a.weight"].tensor_type).astype(np.float32)
-    q_b = dequantize(tm[f"{pfx}.attn_q_b.weight"].data, tm[f"{pfx}.attn_q_b.weight"].tensor_type).astype(np.float32)
-    kv_a_mqa = dequantize(tm[f"{pfx}.attn_kv_a_mqa.weight"].data, tm[f"{pfx}.attn_kv_a_mqa.weight"].tensor_type).astype(np.float32)
-    k_b = dequantize(tm[f"{pfx}.attn_k_b.weight"].data, tm[f"{pfx}.attn_k_b.weight"].tensor_type).astype(np.float32)
-    v_b = dequantize(tm[f"{pfx}.attn_v_b.weight"].data, tm[f"{pfx}.attn_v_b.weight"].tensor_type).astype(np.float32)
-    attn_out = dequantize(tm[f"{pfx}.attn_output.weight"].data, tm[f"{pfx}.attn_output.weight"].tensor_type).astype(np.float32)
+    attn_norm = dequantize(attn_norm_t.data, attn_norm_t.tensor_type).astype(np.float32)
+    q_a_norm = dequantize(q_a_norm_t.data, q_a_norm_t.tensor_type).astype(np.float32)
+    kv_a_norm = dequantize(kv_a_norm_t.data, kv_a_norm_t.tensor_type).astype(np.float32)
+
+    q_a = dequantize(q_a_t.data, q_a_t.tensor_type).astype(np.float32)
+    q_b = dequantize(q_b_t.data, q_b_t.tensor_type).astype(np.float32)
+    kv_a_mqa = dequantize(kv_a_t.data, kv_a_t.tensor_type).astype(np.float32)
+    k_b = dequantize(k_b_t.data, k_b_t.tensor_type).astype(np.float32)
+    v_b = dequantize(v_b_t.data, v_b_t.tensor_type).astype(np.float32)
+    attn_out = dequantize(attn_out_t.data, attn_out_t.tensor_type).astype(np.float32)
 
     if attn_norm.shape != (cfg.dim,):
-        raise ValueError(f"{pfx}.attn_norm.weight shape mismatch: got {attn_norm.shape}, expected ({cfg.dim},)")
+        raise ValueError(
+            f"{pfx}.attn_norm.weight shape mismatch: got {attn_norm.shape}, expected ({cfg.dim},)"
+        )
     if q_a_norm.shape != (cfg.q_lora_rank,):
-        raise ValueError(f"{pfx}.attn_q_a_norm.weight shape mismatch: got {q_a_norm.shape}, expected ({cfg.q_lora_rank},)")
+        raise ValueError(
+            f"{pfx}.attn_q_a_norm.weight shape mismatch: got {q_a_norm.shape}, expected ({cfg.q_lora_rank},)"
+        )
     if kv_a_norm.shape != (cfg.kv_lora_rank,):
-        raise ValueError(f"{pfx}.attn_kv_a_norm.weight shape mismatch: got {kv_a_norm.shape}, expected ({cfg.kv_lora_rank},)")
+        raise ValueError(
+            f"{pfx}.attn_kv_a_norm.weight shape mismatch: got {kv_a_norm.shape}, expected ({cfg.kv_lora_rank},)"
+        )
     if q_a.shape != (cfg.q_lora_rank, cfg.dim):
-        raise ValueError(f"{pfx}.attn_q_a.weight shape mismatch: got {q_a.shape}, expected ({cfg.q_lora_rank}, {cfg.dim})")
+        raise ValueError(
+            f"{pfx}.attn_q_a.weight shape mismatch: got {q_a.shape}, expected ({cfg.q_lora_rank}, {cfg.dim})"
+        )
     if kv_a_mqa.shape != (cfg.kv_lora_rank + cfg.rope_dim, cfg.dim):
         raise ValueError(
             f"{pfx}.attn_kv_a_mqa.weight shape mismatch: got {kv_a_mqa.shape}, expected ({cfg.kv_lora_rank + cfg.rope_dim}, {cfg.dim})"
@@ -198,19 +228,25 @@ def prepare_layer_attention_quantized(
     if q_b.shape[1] != cfg.q_lora_rank:
         raise ValueError(f"{pfx}.attn_q_b.weight bad rank dim: got {q_b.shape}")
     if q_b.shape[0] % cfg.n_heads != 0:
-        raise ValueError(f"{pfx}.attn_q_b.weight rows not divisible by n_heads: {q_b.shape[0]} vs {cfg.n_heads}")
+        raise ValueError(
+            f"{pfx}.attn_q_b.weight rows not divisible by n_heads: {q_b.shape[0]} vs {cfg.n_heads}"
+        )
 
     head_k_dim = int(q_b.shape[0] // cfg.n_heads)
     qk_nope_dim = head_k_dim - cfg.rope_dim
     if qk_nope_dim <= 0:
-        raise ValueError(f"{pfx}.attn_q_b.weight invalid derived dims: head_k={head_k_dim} rope={cfg.rope_dim}")
+        raise ValueError(
+            f"{pfx}.attn_q_b.weight invalid derived dims: head_k={head_k_dim} rope={cfg.rope_dim}"
+        )
 
     if k_b.shape != (cfg.n_heads, cfg.kv_lora_rank, qk_nope_dim):
         raise ValueError(
             f"{pfx}.attn_k_b.weight shape mismatch: got {k_b.shape}, expected ({cfg.n_heads}, {cfg.kv_lora_rank}, {qk_nope_dim})"
         )
     if v_b.shape[0] != cfg.n_heads or v_b.shape[2] != cfg.kv_lora_rank:
-        raise ValueError(f"{pfx}.attn_v_b.weight shape mismatch: got {v_b.shape}, expected head-major with kv rank {cfg.kv_lora_rank}")
+        raise ValueError(
+            f"{pfx}.attn_v_b.weight shape mismatch: got {v_b.shape}, expected head-major with kv rank {cfg.kv_lora_rank}"
+        )
     v_head_dim = int(v_b.shape[1])
 
     if attn_out.shape != (cfg.dim, cfg.n_heads * v_head_dim):
@@ -222,17 +258,19 @@ def prepare_layer_attention_quantized(
         exp_qk_nope, exp_head_k, exp_v_head = expected_dims
         got_dims = (qk_nope_dim, head_k_dim, v_head_dim)
         if got_dims != expected_dims:
-            raise ValueError(f"{pfx} attention dims mismatch: got {got_dims}, expected {expected_dims}")
+            raise ValueError(
+                f"{pfx} attention dims mismatch: got {got_dims}, expected {expected_dims}"
+            )
 
     k_b_rows = k_b.reshape(cfg.n_heads * cfg.kv_lora_rank, qk_nope_dim)
     v_b_rows = v_b.reshape(cfg.n_heads * v_head_dim, cfg.kv_lora_rank)
 
-    q_a_q, q_a_s = quantize_q80_rows(q_a)
-    q_b_q, q_b_s = quantize_q80_rows(q_b)
-    kv_a_q, kv_a_s = quantize_q80_rows(kv_a_mqa)
-    k_b_q, k_b_s = quantize_q80_rows(k_b_rows)
-    v_b_q, v_b_s = quantize_q80_rows(v_b_rows)
-    attn_out_q, attn_out_s = quantize_q80_rows(attn_out)
+    q_a_q, q_a_s = pack_runtime_rows(q_a_t, q_a)
+    q_b_q, q_b_s = pack_runtime_rows(q_b_t, q_b)
+    kv_a_q, kv_a_s = pack_runtime_rows(kv_a_t, kv_a_mqa)
+    k_b_q, k_b_s = pack_runtime_rows(k_b_t, k_b_rows)
+    v_b_q, v_b_s = pack_runtime_rows(v_b_t, v_b_rows)
+    attn_out_q, attn_out_s = pack_runtime_rows(attn_out_t, attn_out)
 
     return {
         "qk_nope_dim": qk_nope_dim,
@@ -284,36 +322,65 @@ def prepare_layer_moe_shared_quantized(
         raise ValueError("moe shared path is defined for layers >= 1")
 
     pfx = f"blk.{layer_idx}"
-    ffn_norm = dequantize(tm[f"{pfx}.ffn_norm.weight"].data, tm[f"{pfx}.ffn_norm.weight"].tensor_type).astype(np.float32)
-    gate_inp = dequantize(tm[f"{pfx}.ffn_gate_inp.weight"].data, tm[f"{pfx}.ffn_gate_inp.weight"].tensor_type).astype(np.float32)
-    exp_probs_b = dequantize(tm[f"{pfx}.exp_probs_b.bias"].data, tm[f"{pfx}.exp_probs_b.bias"].tensor_type).astype(np.float32)
+    ffn_norm_t = tm[f"{pfx}.ffn_norm.weight"]
+    gate_inp_t = tm[f"{pfx}.ffn_gate_inp.weight"]
+    exp_probs_b_t = tm[f"{pfx}.exp_probs_b.bias"]
+    gate_shexp_t = tm[f"{pfx}.ffn_gate_shexp.weight"]
+    up_shexp_t = tm[f"{pfx}.ffn_up_shexp.weight"]
+    down_shexp_t = tm[f"{pfx}.ffn_down_shexp.weight"]
 
-    gate_shexp = dequantize(tm[f"{pfx}.ffn_gate_shexp.weight"].data, tm[f"{pfx}.ffn_gate_shexp.weight"].tensor_type).astype(np.float32)
-    up_shexp = dequantize(tm[f"{pfx}.ffn_up_shexp.weight"].data, tm[f"{pfx}.ffn_up_shexp.weight"].tensor_type).astype(np.float32)
-    down_shexp = dequantize(tm[f"{pfx}.ffn_down_shexp.weight"].data, tm[f"{pfx}.ffn_down_shexp.weight"].tensor_type).astype(np.float32)
+    ffn_norm = dequantize(ffn_norm_t.data, ffn_norm_t.tensor_type).astype(np.float32)
+    gate_inp = dequantize(gate_inp_t.data, gate_inp_t.tensor_type).astype(np.float32)
+    exp_probs_b = dequantize(exp_probs_b_t.data, exp_probs_b_t.tensor_type).astype(
+        np.float32
+    )
+
+    gate_shexp = dequantize(gate_shexp_t.data, gate_shexp_t.tensor_type).astype(
+        np.float32
+    )
+    up_shexp = dequantize(up_shexp_t.data, up_shexp_t.tensor_type).astype(np.float32)
+    down_shexp = dequantize(down_shexp_t.data, down_shexp_t.tensor_type).astype(
+        np.float32
+    )
 
     if ffn_norm.shape != (cfg.dim,):
-        raise ValueError(f"{pfx}.ffn_norm.weight shape mismatch: got {ffn_norm.shape}, expected ({cfg.dim},)")
+        raise ValueError(
+            f"{pfx}.ffn_norm.weight shape mismatch: got {ffn_norm.shape}, expected ({cfg.dim},)"
+        )
     if gate_inp.shape != (cfg.n_routed_experts, cfg.dim):
-        raise ValueError(f"{pfx}.ffn_gate_inp.weight shape mismatch: got {gate_inp.shape}, expected ({cfg.n_routed_experts}, {cfg.dim})")
+        raise ValueError(
+            f"{pfx}.ffn_gate_inp.weight shape mismatch: got {gate_inp.shape}, expected ({cfg.n_routed_experts}, {cfg.dim})"
+        )
     if exp_probs_b.shape != (cfg.n_routed_experts,):
-        raise ValueError(f"{pfx}.exp_probs_b.bias shape mismatch: got {exp_probs_b.shape}, expected ({cfg.n_routed_experts},)")
+        raise ValueError(
+            f"{pfx}.exp_probs_b.bias shape mismatch: got {exp_probs_b.shape}, expected ({cfg.n_routed_experts},)"
+        )
 
     if gate_shexp.shape[1] != cfg.dim:
-        raise ValueError(f"{pfx}.ffn_gate_shexp.weight shape mismatch: got {gate_shexp.shape}, expected second dim {cfg.dim}")
+        raise ValueError(
+            f"{pfx}.ffn_gate_shexp.weight shape mismatch: got {gate_shexp.shape}, expected second dim {cfg.dim}"
+        )
     if up_shexp.shape != gate_shexp.shape:
-        raise ValueError(f"{pfx}.ffn_up_shexp.weight shape mismatch: got {up_shexp.shape}, expected {gate_shexp.shape}")
+        raise ValueError(
+            f"{pfx}.ffn_up_shexp.weight shape mismatch: got {up_shexp.shape}, expected {gate_shexp.shape}"
+        )
     moe_dim = int(gate_shexp.shape[0])
     if down_shexp.shape != (cfg.dim, moe_dim):
-        raise ValueError(f"{pfx}.ffn_down_shexp.weight shape mismatch: got {down_shexp.shape}, expected ({cfg.dim}, {moe_dim})")
+        raise ValueError(
+            f"{pfx}.ffn_down_shexp.weight shape mismatch: got {down_shexp.shape}, expected ({cfg.dim}, {moe_dim})"
+        )
     if expected_moe_dim is not None and moe_dim != expected_moe_dim:
-        raise ValueError(f"{pfx} shared expert dim mismatch: got {moe_dim}, expected {expected_moe_dim}")
+        raise ValueError(
+            f"{pfx} shared expert dim mismatch: got {moe_dim}, expected {expected_moe_dim}"
+        )
     if moe_dim % GROUP_SIZE != 0:
-        raise ValueError(f"{pfx} shared expert dim must be divisible by {GROUP_SIZE}: got {moe_dim}")
+        raise ValueError(
+            f"{pfx} shared expert dim must be divisible by {GROUP_SIZE}: got {moe_dim}"
+        )
 
-    gate_sh_q, gate_sh_s = quantize_q80_rows(gate_shexp)
-    up_sh_q, up_sh_s = quantize_q80_rows(up_shexp)
-    down_sh_q, down_sh_s = quantize_q80_rows(down_shexp)
+    gate_sh_q, gate_sh_s = pack_runtime_rows(gate_shexp_t, gate_shexp)
+    up_sh_q, up_sh_s = pack_runtime_rows(up_shexp_t, up_shexp)
+    down_sh_q, down_sh_s = pack_runtime_rows(down_shexp_t, down_shexp)
 
     return {
         "moe_dim": moe_dim,
@@ -351,26 +418,36 @@ def prepare_layer_moe_routed_quantized(
         raise ValueError("moe routed path is defined for layers >= 1")
 
     pfx = f"blk.{layer_idx}"
-    gate_exps = dequantize(tm[f"{pfx}.ffn_gate_exps.weight"].data, tm[f"{pfx}.ffn_gate_exps.weight"].tensor_type).astype(np.float32)
-    up_exps = dequantize(tm[f"{pfx}.ffn_up_exps.weight"].data, tm[f"{pfx}.ffn_up_exps.weight"].tensor_type).astype(np.float32)
-    down_exps = dequantize(tm[f"{pfx}.ffn_down_exps.weight"].data, tm[f"{pfx}.ffn_down_exps.weight"].tensor_type).astype(np.float32)
+    gate_exps_t = tm[f"{pfx}.ffn_gate_exps.weight"]
+    up_exps_t = tm[f"{pfx}.ffn_up_exps.weight"]
+    down_exps_t = tm[f"{pfx}.ffn_down_exps.weight"]
+
+    gate_exps = dequantize(gate_exps_t.data, gate_exps_t.tensor_type).astype(np.float32)
+    up_exps = dequantize(up_exps_t.data, up_exps_t.tensor_type).astype(np.float32)
+    down_exps = dequantize(down_exps_t.data, down_exps_t.tensor_type).astype(np.float32)
 
     expected_gate_up = (cfg.n_routed_experts, moe_dim, cfg.dim)
     expected_down = (cfg.n_routed_experts, cfg.dim, moe_dim)
     if gate_exps.shape != expected_gate_up:
-        raise ValueError(f"{pfx}.ffn_gate_exps.weight shape mismatch: got {gate_exps.shape}, expected {expected_gate_up}")
+        raise ValueError(
+            f"{pfx}.ffn_gate_exps.weight shape mismatch: got {gate_exps.shape}, expected {expected_gate_up}"
+        )
     if up_exps.shape != expected_gate_up:
-        raise ValueError(f"{pfx}.ffn_up_exps.weight shape mismatch: got {up_exps.shape}, expected {expected_gate_up}")
+        raise ValueError(
+            f"{pfx}.ffn_up_exps.weight shape mismatch: got {up_exps.shape}, expected {expected_gate_up}"
+        )
     if down_exps.shape != expected_down:
-        raise ValueError(f"{pfx}.ffn_down_exps.weight shape mismatch: got {down_exps.shape}, expected {expected_down}")
+        raise ValueError(
+            f"{pfx}.ffn_down_exps.weight shape mismatch: got {down_exps.shape}, expected {expected_down}"
+        )
 
     gate_rows = gate_exps.reshape(cfg.n_routed_experts * moe_dim, cfg.dim)
     up_rows = up_exps.reshape(cfg.n_routed_experts * moe_dim, cfg.dim)
     down_rows = down_exps.reshape(cfg.n_routed_experts * cfg.dim, moe_dim)
 
-    gate_q, gate_s = quantize_q80_rows(gate_rows)
-    up_q, up_s = quantize_q80_rows(up_rows)
-    down_q, down_s = quantize_q80_rows(down_rows)
+    gate_q, gate_s = pack_runtime_rows(gate_exps_t, gate_rows)
+    up_q, up_s = pack_runtime_rows(up_exps_t, up_rows)
+    down_q, down_s = pack_runtime_rows(down_exps_t, down_rows)
 
     return {
         "gate_q": gate_q,
@@ -425,7 +502,9 @@ def write_template_sidecars(reader: GGUFReader, out_prefix: Path):
     )
 
     if isinstance(chat_template, list):
-        chat_template = chat_template[0] if chat_template else "<|user|>\n%s\n<|assistant|>\n"
+        chat_template = (
+            chat_template[0] if chat_template else "<|user|>\n%s\n<|assistant|>\n"
+        )
 
     base = str(chat_template)
     for suffix in [
@@ -442,29 +521,46 @@ def write_template_sidecars(reader: GGUFReader, out_prefix: Path):
 def write_runtime_bin(reader: GGUFReader, cfg: Config, out_path: Path):
     tm = tensor_map(reader)
 
-    out_norm = dequantize(tm["output_norm.weight"].data, tm["output_norm.weight"].tensor_type).astype(np.float32)
+    out_norm = dequantize(
+        tm["output_norm.weight"].data, tm["output_norm.weight"].tensor_type
+    ).astype(np.float32)
     if out_norm.shape != (cfg.dim,):
-        raise ValueError(f"output_norm.weight shape mismatch: got {out_norm.shape}, expected ({cfg.dim},)")
+        raise ValueError(
+            f"output_norm.weight shape mismatch: got {out_norm.shape}, expected ({cfg.dim},)"
+        )
 
-    tok_emb = dequantize(tm["token_embd.weight"].data, tm["token_embd.weight"].tensor_type).astype(np.float32)
-    out_w = dequantize(tm["output.weight"].data, tm["output.weight"].tensor_type).astype(np.float32)
+    tok_emb_t = tm["token_embd.weight"]
+    out_w_t = tm["output.weight"]
+    tok_emb = dequantize(tok_emb_t.data, tok_emb_t.tensor_type).astype(np.float32)
+    out_w = dequantize(out_w_t.data, out_w_t.tensor_type).astype(np.float32)
 
     expected = (cfg.vocab_size, cfg.dim)
     if tok_emb.shape != expected:
-        raise ValueError(f"token_embd.weight shape mismatch: got {tok_emb.shape}, expected {expected}")
+        raise ValueError(
+            f"token_embd.weight shape mismatch: got {tok_emb.shape}, expected {expected}"
+        )
     if out_w.shape != expected:
-        raise ValueError(f"output.weight shape mismatch: got {out_w.shape}, expected {expected}")
+        raise ValueError(
+            f"output.weight shape mismatch: got {out_w.shape}, expected {expected}"
+        )
 
-    tok_q, tok_s = quantize_q80_rows(tok_emb)
-    out_q, out_s = quantize_q80_rows(out_w)
+    tok_q, tok_s = pack_runtime_rows(tok_emb_t, tok_emb)
+    out_q, out_s = pack_runtime_rows(out_w_t, out_w)
 
-    l0_ffn_norm = dequantize(tm["blk.0.ffn_norm.weight"].data, tm["blk.0.ffn_norm.weight"].tensor_type).astype(np.float32)
+    l0_ffn_norm = dequantize(
+        tm["blk.0.ffn_norm.weight"].data, tm["blk.0.ffn_norm.weight"].tensor_type
+    ).astype(np.float32)
     if l0_ffn_norm.shape != (cfg.dim,):
-        raise ValueError(f"blk.0.ffn_norm.weight shape mismatch: got {l0_ffn_norm.shape}, expected ({cfg.dim},)")
+        raise ValueError(
+            f"blk.0.ffn_norm.weight shape mismatch: got {l0_ffn_norm.shape}, expected ({cfg.dim},)"
+        )
 
-    l0_gate = dequantize(tm["blk.0.ffn_gate.weight"].data, tm["blk.0.ffn_gate.weight"].tensor_type).astype(np.float32)
-    l0_up = dequantize(tm["blk.0.ffn_up.weight"].data, tm["blk.0.ffn_up.weight"].tensor_type).astype(np.float32)
-    l0_down = dequantize(tm["blk.0.ffn_down.weight"].data, tm["blk.0.ffn_down.weight"].tensor_type).astype(np.float32)
+    l0_gate_t = tm["blk.0.ffn_gate.weight"]
+    l0_up_t = tm["blk.0.ffn_up.weight"]
+    l0_down_t = tm["blk.0.ffn_down.weight"]
+    l0_gate = dequantize(l0_gate_t.data, l0_gate_t.tensor_type).astype(np.float32)
+    l0_up = dequantize(l0_up_t.data, l0_up_t.tensor_type).astype(np.float32)
+    l0_down = dequantize(l0_down_t.data, l0_down_t.tensor_type).astype(np.float32)
 
     if l0_gate.shape != (cfg.hidden_dim, cfg.dim):
         raise ValueError(
@@ -479,9 +575,9 @@ def write_runtime_bin(reader: GGUFReader, cfg: Config, out_path: Path):
             f"blk.0.ffn_down.weight shape mismatch: got {l0_down.shape}, expected ({cfg.dim}, {cfg.hidden_dim})"
         )
 
-    l0_gate_q, l0_gate_s = quantize_q80_rows(l0_gate)
-    l0_up_q, l0_up_s = quantize_q80_rows(l0_up)
-    l0_down_q, l0_down_s = quantize_q80_rows(l0_down)
+    l0_gate_q, l0_gate_s = pack_runtime_rows(l0_gate_t, l0_gate)
+    l0_up_q, l0_up_s = pack_runtime_rows(l0_up_t, l0_up)
+    l0_down_q, l0_down_s = pack_runtime_rows(l0_down_t, l0_down)
 
     l0_attn = prepare_layer_attention_quantized(tm, cfg, 0)
     l0_qk_nope_dim = int(l0_attn["qk_nope_dim"])
@@ -657,7 +753,11 @@ def write_runtime_bin(reader: GGUFReader, cfg: Config, out_path: Path):
             )
         )
         # v4 extension block (fits in header padding and keeps base layout backward compatible)
-        f.write(struct.pack("<5i", l0_qk_nope_dim, l0_head_k_dim, l0_v_head_dim, 1, moe_ffn_dim))
+        f.write(
+            struct.pack(
+                "<5i", l0_qk_nope_dim, l0_head_k_dim, l0_v_head_dim, 1, moe_ffn_dim
+            )
+        )
         pad = HEADER_SIZE - f.tell()
         if pad < 0:
             raise ValueError("header overflow")
@@ -695,21 +795,27 @@ def write_runtime_bin(reader: GGUFReader, cfg: Config, out_path: Path):
         write_attention_layer_block(f, l0_attn)
         expected_dims = (l0_qk_nope_dim, l0_head_k_dim, l0_v_head_dim)
         for layer_idx in range(1, cfg.n_layers):
-            layer_pack = prepare_layer_attention_quantized(tm, cfg, layer_idx, expected_dims=expected_dims)
+            layer_pack = prepare_layer_attention_quantized(
+                tm, cfg, layer_idx, expected_dims=expected_dims
+            )
             write_attention_layer_block(f, layer_pack)
 
         # Append shared-expert FFN tensors for MoE layers (1..n_layers-1).
         if cfg.n_layers > 1 and l1_moe is not None:
             write_moe_shared_layer_block(f, l1_moe)
             for layer_idx in range(2, cfg.n_layers):
-                moe_pack = prepare_layer_moe_shared_quantized(tm, cfg, layer_idx, expected_moe_dim=moe_ffn_dim)
+                moe_pack = prepare_layer_moe_shared_quantized(
+                    tm, cfg, layer_idx, expected_moe_dim=moe_ffn_dim
+                )
                 write_moe_shared_layer_block(f, moe_pack)
 
         # Append routed expert tensors for MoE layers (1..n_layers-1).
         if cfg.n_layers > 1 and l1_moe_routed is not None:
             write_moe_routed_layer_block(f, l1_moe_routed)
             for layer_idx in range(2, cfg.n_layers):
-                routed_pack = prepare_layer_moe_routed_quantized(tm, cfg, layer_idx, moe_ffn_dim)
+                routed_pack = prepare_layer_moe_routed_quantized(
+                    tm, cfg, layer_idx, moe_ffn_dim
+                )
                 write_moe_routed_layer_block(f, routed_pack)
 
     print("Export summary:")
@@ -755,7 +861,9 @@ def write_runtime_bin(reader: GGUFReader, cfg: Config, out_path: Path):
         f" moe_routed_layer={moe_routed_layer_bytes:,}"
         f" moe_routed_total={all_moe_routed_bytes:,}"
     )
-    print(f"  l0_mla_dims: qk_nope={l0_qk_nope_dim} head_k={l0_head_k_dim} v_head={l0_v_head_dim}")
+    print(
+        f"  l0_mla_dims: qk_nope={l0_qk_nope_dim} head_k={l0_head_k_dim} v_head={l0_v_head_dim}"
+    )
     if moe_ffn_dim > 0:
         print(f"  moe_shared_dim: {moe_ffn_dim}")
 

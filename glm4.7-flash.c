@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #if defined _WIN32
 #include "win.h"
 #else
@@ -194,7 +198,39 @@ typedef struct {
     float *moe_topk_w;     // [n_experts_used]
 } RunState;
 
+typedef enum {
+    BACKEND_CPU = 0,
+    BACKEND_METAL = 1,
+} BackendType;
+
 static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids, int max_ids, int bos);
+static void assert_finite_slice(const char *name, const float *x, int n, int debug_mode);
+
+#if defined(__APPLE__) && defined(GLM_ENABLE_METAL)
+int glm_metal_init(const Runtime *rt, RunState *st);
+void glm_metal_prepare(const Runtime *rt, RunState *st);
+int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode);
+void glm_metal_free(void);
+#else
+static int glm_metal_init(const Runtime *rt, RunState *st) {
+    (void)rt;
+    (void)st;
+    return -1;
+}
+static void glm_metal_prepare(const Runtime *rt, RunState *st) {
+    (void)rt;
+    (void)st;
+}
+static int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode) {
+    (void)rt;
+    (void)st;
+    (void)token;
+    (void)pos;
+    (void)debug_mode;
+    return -1;
+}
+static void glm_metal_free(void) {}
+#endif
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -899,6 +935,9 @@ static void dequant_row_q80(const int8_t *qrow, const float *srow, float *out, i
 
 static void matvec_q80_rows(const int8_t *qmat, const float *smat, const float *x, float *y, int rows, int dim, int gs) {
     int n_groups = dim / gs;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (rows >= 64)
+#endif
     for (int r = 0; r < rows; r++) {
         const int8_t *qrow = qmat + (size_t)r * dim;
         const float *srow = smat + (size_t)r * n_groups;
@@ -907,11 +946,22 @@ static void matvec_q80_rows(const int8_t *qmat, const float *smat, const float *
             float s = srow[g];
             int base = g * gs;
             float dot = 0.0f;
+#if defined(_OPENMP)
+#pragma omp simd reduction(+:dot)
+#endif
             for (int k = 0; k < gs; k++) dot += (float)qrow[base + k] * x[base + k];
             acc += s * dot;
         }
         y[r] = acc;
     }
+}
+
+static void dequant_row(const int8_t *qrow, const float *srow, float *out, int dim, int gs) {
+    dequant_row_q80(qrow, srow, out, dim, gs);
+}
+
+static void matvec_rows(const int8_t *qmat, const float *smat, const float *x, float *y, int rows, int dim, int gs) {
+    matvec_q80_rows(qmat, smat, x, y, rows, dim, gs);
 }
 
 static void runstate_init(RunState *s) {
@@ -1036,7 +1086,7 @@ static void apply_rope_inplace(float *x, int dim, int pos) {
     }
 }
 
-static void apply_mla_attention_layer(const Runtime *rt, const LayerAttnWeights *w, RunState *s, int gs, int pos, int layer_idx) {
+static void apply_mla_attention_layer(const Runtime *rt, const LayerAttnWeights *w, RunState *s, int gs, int pos, int layer_idx, int debug_mode) {
     if (!w) return;
     if (pos < 0 || pos >= s->cache_cap) die("position exceeds attention cache capacity");
     if (layer_idx < 0 || layer_idx >= s->n_attn_layers) die("invalid attention layer index");
@@ -1052,38 +1102,57 @@ static void apply_mla_attention_layer(const Runtime *rt, const LayerAttnWeights 
     const float kq_scale = 1.0f / sqrtf((float)head_k);
 
     rmsnorm(s->xn, s->x, w->attn_norm, dim);
+    assert_finite_slice("attn_xn", s->xn, dim, debug_mode);
 
-    matvec_q80_rows(w->q_a_q, w->q_a_s, s->xn, s->q_a, q_lora, dim, gs);
+    matvec_rows(w->q_a_q, w->q_a_s, s->xn, s->q_a, q_lora, dim, gs);
     rmsnorm(s->q_a, s->q_a, w->q_a_norm, q_lora);
-    matvec_q80_rows(w->q_b_q, w->q_b_s, s->q_a, s->q_full, n_heads * head_k, q_lora, gs);
+    assert_finite_slice("attn_q_a", s->q_a, q_lora, debug_mode);
+    matvec_rows(w->q_b_q, w->q_b_s, s->q_a, s->q_full, n_heads * head_k, q_lora, gs);
+    assert_finite_slice("attn_q_full", s->q_full, n_heads * head_k, debug_mode);
 
-    matvec_q80_rows(w->kv_a_q, w->kv_a_s, s->xn, s->kv_a, kv_lora + rope_dim, dim, gs);
+    matvec_rows(w->kv_a_q, w->kv_a_s, s->xn, s->kv_a, kv_lora + rope_dim, dim, gs);
     rmsnorm(s->kv_a, s->kv_a, w->kv_a_norm, kv_lora);
+    assert_finite_slice("attn_kv_a", s->kv_a, kv_lora, debug_mode);
 
     size_t layer_base = (size_t)layer_idx * (size_t)s->cache_cap;
+    size_t cache_slots = (size_t)s->n_attn_layers * (size_t)s->cache_cap;
+    size_t write_slot = layer_base + (size_t)pos;
+    if (write_slot >= cache_slots) die("attention cache write slot out of bounds");
     float *cache_comp = s->k_cache_comp + (layer_base + (size_t)pos) * (size_t)kv_lora;
     float *cache_pe = s->k_cache_pe + (layer_base + (size_t)pos) * (size_t)rope_dim;
     memcpy(cache_comp, s->kv_a, (size_t)kv_lora * sizeof(float));
     memcpy(cache_pe, s->kv_a + kv_lora, (size_t)rope_dim * sizeof(float));
     apply_rope_inplace(cache_pe, rope_dim, pos);
+    assert_finite_slice("attn_cache_pe", cache_pe, rope_dim, debug_mode);
 
     for (int h = 0; h < n_heads; h++) {
         const float *qh = s->q_full + (size_t)h * (size_t)head_k;
         memcpy(s->q_nope, qh, (size_t)qk_nope * sizeof(float));
         memcpy(s->q_pe, qh + qk_nope, (size_t)rope_dim * sizeof(float));
         apply_rope_inplace(s->q_pe, rope_dim, pos);
+        assert_finite_slice("attn_q_pe", s->q_pe, rope_dim, debug_mode);
 
         const int8_t *k_b_q_h = w->k_b_q + (size_t)h * (size_t)kv_lora * (size_t)qk_nope;
         const float *k_b_s_h = w->k_b_s + (size_t)h * (size_t)kv_lora * (size_t)(qk_nope / gs);
-        matvec_q80_rows(k_b_q_h, k_b_s_h, s->q_nope, s->q_abs, kv_lora, qk_nope, gs);
+        matvec_rows(k_b_q_h, k_b_s_h, s->q_nope, s->q_abs, kv_lora, qk_nope, gs);
+        assert_finite_slice("attn_q_abs", s->q_abs, kv_lora, debug_mode);
 
         for (int t = 0; t <= pos; t++) {
+            size_t read_slot = layer_base + (size_t)t;
+            if (read_slot >= cache_slots) die("attention cache read slot out of bounds");
             const float *kc = s->k_cache_comp + (layer_base + (size_t)t) * (size_t)kv_lora;
             const float *kp = s->k_cache_pe + (layer_base + (size_t)t) * (size_t)rope_dim;
             float score = dot_f32(s->q_abs, kc, kv_lora) + dot_f32(s->q_pe, kp, rope_dim);
             s->att_scores[t] = score * kq_scale;
         }
         softmax_inplace(s->att_scores, pos + 1);
+        assert_finite_slice("attn_scores", s->att_scores, pos + 1, debug_mode);
+        if (debug_mode && pos <= 1 && h == 0) {
+            float s0 = s->att_scores[0];
+            float s1 = (pos > 0) ? s->att_scores[1] : 0.0f;
+            fprintf(stderr, "[glm-attn-score] layer=%d pos=%d head=0 s0=%.6f s1=%.6f\n", layer_idx, pos, s0, s1);
+            fprintf(stderr, "[glm-rope-sum] layer=%d pos=%d q_pe=%.6f k_pe=%.6f\n", layer_idx, pos, sum_f32(s->q_pe, rope_dim), sum_f32(cache_pe, rope_dim));
+        }
 
         memset(s->att_ctx, 0, (size_t)kv_lora * sizeof(float));
         for (int t = 0; t <= pos; t++) {
@@ -1091,28 +1160,39 @@ static void apply_mla_attention_layer(const Runtime *rt, const LayerAttnWeights 
             float p = s->att_scores[t];
             for (int i = 0; i < kv_lora; i++) s->att_ctx[i] += p * kc[i];
         }
+        assert_finite_slice("attn_ctx", s->att_ctx, kv_lora, debug_mode);
 
         const int8_t *v_b_q_h = w->v_b_q + (size_t)h * (size_t)v_head * (size_t)kv_lora;
         const float *v_b_s_h = w->v_b_s + (size_t)h * (size_t)v_head * (size_t)(kv_lora / gs);
-        matvec_q80_rows(v_b_q_h, v_b_s_h, s->att_ctx, s->att_concat + (size_t)h * (size_t)v_head, v_head, kv_lora, gs);
+        matvec_rows(v_b_q_h, v_b_s_h, s->att_ctx, s->att_concat + (size_t)h * (size_t)v_head, v_head, kv_lora, gs);
+        assert_finite_slice("attn_concat_h", s->att_concat + (size_t)h * (size_t)v_head, v_head, debug_mode);
     }
 
-    matvec_q80_rows(w->attn_out_q, w->attn_out_s, s->att_concat, s->xb, dim, n_heads * v_head, gs);
+    assert_finite_slice("attn_concat", s->att_concat, n_heads * v_head, debug_mode);
+    matvec_rows(w->attn_out_q, w->attn_out_s, s->att_concat, s->xb, dim, n_heads * v_head, gs);
+    assert_finite_slice("attn_xb", s->xb, dim, debug_mode);
     for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
+    assert_finite_slice("attn_x", s->x, dim, debug_mode);
 }
 
-static void apply_l0_dense_ffn(const Runtime *rt, RunState *s, int gs) {
+static void apply_l0_dense_ffn(const Runtime *rt, RunState *s, int gs, int debug_mode) {
     if (!rt->has_l0_ffn) return;
     rmsnorm(s->xn, s->x, rt->l0_ffn_norm, rt->cfg.dim);
-    matvec_q80_rows(rt->l0_ffn_gate_q, rt->l0_ffn_gate_s, s->xn, s->ff_gate, rt->cfg.hidden_dim, rt->cfg.dim, gs);
-    matvec_q80_rows(rt->l0_ffn_up_q, rt->l0_ffn_up_s, s->xn, s->ff_up, rt->cfg.hidden_dim, rt->cfg.dim, gs);
+    assert_finite_slice("l0_ffn_xn", s->xn, rt->cfg.dim, debug_mode);
+    matvec_rows(rt->l0_ffn_gate_q, rt->l0_ffn_gate_s, s->xn, s->ff_gate, rt->cfg.hidden_dim, rt->cfg.dim, gs);
+    matvec_rows(rt->l0_ffn_up_q, rt->l0_ffn_up_s, s->xn, s->ff_up, rt->cfg.hidden_dim, rt->cfg.dim, gs);
+    assert_finite_slice("l0_ffn_gate_pre", s->ff_gate, rt->cfg.hidden_dim, debug_mode);
+    assert_finite_slice("l0_ffn_up", s->ff_up, rt->cfg.hidden_dim, debug_mode);
     for (int i = 0; i < rt->cfg.hidden_dim; i++) {
         s->ff_gate[i] = silu(s->ff_gate[i]) * s->ff_up[i];
     }
-    matvec_q80_rows(rt->l0_ffn_down_q, rt->l0_ffn_down_s, s->ff_gate, s->xb, rt->cfg.dim, rt->cfg.hidden_dim, gs);
+    assert_finite_slice("l0_ffn_gate", s->ff_gate, rt->cfg.hidden_dim, debug_mode);
+    matvec_rows(rt->l0_ffn_down_q, rt->l0_ffn_down_s, s->ff_gate, s->xb, rt->cfg.dim, rt->cfg.hidden_dim, gs);
+    assert_finite_slice("l0_ffn_xb", s->xb, rt->cfg.dim, debug_mode);
     for (int i = 0; i < rt->cfg.dim; i++) {
         s->x[i] += s->xb[i];
     }
+    assert_finite_slice("l0_ffn_x", s->x, rt->cfg.dim, debug_mode);
 }
 
 static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, int layer_idx, int debug_mode, int pos) {
@@ -1127,6 +1207,7 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
     const int n_routed = rt->cfg.n_routed_experts;
 
     rmsnorm(s->xn, s->x, w->ffn_norm, dim);
+    assert_finite_slice("moe_xn", s->xn, dim, debug_mode);
 
     // Router probabilities for routed experts. For DeepSeek2, expert selection uses
     // probs + exp_probs_b, but expert weights themselves remain unbiased probs.
@@ -1135,6 +1216,7 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
         float logit = dot_f32(gw, s->xn, dim);
         s->moe_router[e] = 1.0f / (1.0f + expf(-logit)); // sigmoid gating
     }
+    assert_finite_slice("moe_router", s->moe_router, n_routed, debug_mode);
 
     // Select top-k experts.
     const int top_k = rt->cfg.n_experts_used;
@@ -1172,7 +1254,7 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
         float inv = 1.0f / denom;
         for (int k = 0; k < top_k; k++) s->moe_topk_w[k] *= inv;
     }
-    if (debug_mode && top_k >= 4) {
+    if (debug_mode && layer_idx >= 38 && top_k >= 4) {
         int s_ids = 0;
         float norm_sum = 0.0f;
         for (int k = 0; k < top_k; k++) {
@@ -1210,28 +1292,38 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
                 const int8_t *dq = rw->down_q + (size_t)e * (size_t)dim * (size_t)moe_dim;
                 const float *dsr = rw->down_s + (size_t)e * (size_t)dim * (size_t)moe_groups;
 
-                matvec_q80_rows(gq, gsr, s->xn, s->moe_gate, moe_dim, dim, gs);
-                matvec_q80_rows(uq, usr, s->xn, s->moe_up, moe_dim, dim, gs);
+                matvec_rows(gq, gsr, s->xn, s->moe_gate, moe_dim, dim, gs);
+                matvec_rows(uq, usr, s->xn, s->moe_up, moe_dim, dim, gs);
+                assert_finite_slice("moe_routed_gate_pre", s->moe_gate, moe_dim, debug_mode);
+                assert_finite_slice("moe_routed_up", s->moe_up, moe_dim, debug_mode);
                 for (int i = 0; i < moe_dim; i++) s->moe_gate[i] = silu(s->moe_gate[i]) * s->moe_up[i];
-                matvec_q80_rows(dq, dsr, s->moe_gate, s->xb, dim, moe_dim, gs);
+                assert_finite_slice("moe_routed_gate", s->moe_gate, moe_dim, debug_mode);
+                matvec_rows(dq, dsr, s->moe_gate, s->xb, dim, moe_dim, gs);
+                assert_finite_slice("moe_routed_xb", s->xb, dim, debug_mode);
                 for (int i = 0; i < dim; i++) s->moe_out_acc[i] += w_e * s->xb[i];
             }
         }
     }
 
-    matvec_q80_rows(w->gate_sh_q, w->gate_sh_s, s->xn, s->moe_gate, moe_dim, dim, gs);
-    matvec_q80_rows(w->up_sh_q, w->up_sh_s, s->xn, s->moe_up, moe_dim, dim, gs);
+    matvec_rows(w->gate_sh_q, w->gate_sh_s, s->xn, s->moe_gate, moe_dim, dim, gs);
+    matvec_rows(w->up_sh_q, w->up_sh_s, s->xn, s->moe_up, moe_dim, dim, gs);
+    assert_finite_slice("moe_shared_gate_pre", s->moe_gate, moe_dim, debug_mode);
+    assert_finite_slice("moe_shared_up", s->moe_up, moe_dim, debug_mode);
     for (int i = 0; i < moe_dim; i++) {
         s->moe_gate[i] = silu(s->moe_gate[i]) * s->moe_up[i];
     }
-    matvec_q80_rows(w->down_sh_q, w->down_sh_s, s->moe_gate, s->xb, dim, moe_dim, gs);
+    assert_finite_slice("moe_shared_gate", s->moe_gate, moe_dim, debug_mode);
+    matvec_rows(w->down_sh_q, w->down_sh_s, s->moe_gate, s->xb, dim, moe_dim, gs);
+    assert_finite_slice("moe_shared_xb", s->xb, dim, debug_mode);
     if (debug_mode) {
         fprintf(stderr, "[glm-layer-sum] ffn_moe_out-%d sum=%.6f\n", layer_idx, sum_f32(s->moe_out_acc, dim));
         fprintf(stderr, "[glm-layer-sum] ffn_shexp-%d sum=%.6f\n", layer_idx, sum_f32(s->xb, dim));
     }
+    assert_finite_slice("moe_out_acc", s->moe_out_acc, dim, debug_mode);
     for (int i = 0; i < dim; i++) {
         s->x[i] += s->xb[i] + s->moe_out_acc[i];
     }
+    assert_finite_slice("moe_x", s->x, dim, debug_mode);
 }
 
 static int argmax(const float *x, int n) {
@@ -1292,7 +1384,7 @@ static void debug_print_prompt_embd_batch(const Runtime *rt, const int *prompt_i
         if (tok < 0 || tok >= rt->cfg.vocab_size) tok = 0;
         const int8_t *eq = rt->tok_q + (size_t)tok * (size_t)dim;
         const float *es = rt->tok_s + (size_t)tok * (size_t)n_groups;
-        dequant_row_q80(eq, es, row, dim, gs);
+        dequant_row(eq, es, row, dim, gs);
 
         for (int i = 0; i < dim; i++) sum += row[i];
 
@@ -1422,7 +1514,7 @@ static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids,
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--debug] [--self-test-tokenizer]\n", prog);
+    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--backend cpu|metal] [--debug] [--self-test-tokenizer]\n", prog);
 }
 
 static char *read_text_file_alloc(const char *path) {
@@ -1460,6 +1552,7 @@ static char *read_text_file_alloc(const char *path) {
 }
 
 static void assert_finite_slice(const char *name, const float *x, int n, int debug_mode) {
+    if (!debug_mode) return;
     for (int i = 0; i < n; i++) {
         if (!isfinite(x[i])) {
             fprintf(stderr, "[error] non-finite value in %s at i=%d: %f\n", name, i, x[i]);
@@ -1560,6 +1653,97 @@ static void print_topk_debug(const float *logits, const Tokenizer *tok, int voca
     free(val);
 }
 
+int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode) {
+    if (!rt || !st) return -1;
+    if (token < 0 || token >= rt->cfg.vocab_size) token = 0;
+
+    LayerAttnWeights l0_attn_weights = {
+        .attn_norm = rt->l0_attn_norm,
+        .q_a_norm = rt->l0_q_a_norm,
+        .kv_a_norm = rt->l0_kv_a_norm,
+        .q_a_q = rt->l0_q_a_q,
+        .q_a_s = rt->l0_q_a_s,
+        .q_b_q = rt->l0_q_b_q,
+        .q_b_s = rt->l0_q_b_s,
+        .kv_a_q = rt->l0_kv_a_q,
+        .kv_a_s = rt->l0_kv_a_s,
+        .k_b_q = rt->l0_k_b_q,
+        .k_b_s = rt->l0_k_b_s,
+        .v_b_q = rt->l0_v_b_q,
+        .v_b_s = rt->l0_v_b_s,
+        .attn_out_q = rt->l0_attn_out_q,
+        .attn_out_s = rt->l0_attn_out_s,
+    };
+
+    int gs = (int)rt->cfg.group_size;
+    int n_groups = rt->cfg.dim / gs;
+    const int8_t *eq = rt->tok_q + (size_t)token * (size_t)rt->cfg.dim;
+    const float *es = rt->tok_s + (size_t)token * (size_t)n_groups;
+    dequant_row(eq, es, st->x, rt->cfg.dim, gs);
+    assert_finite_slice("embed", st->x, rt->cfg.dim, debug_mode);
+    if (debug_mode && pos == 0) {
+        debug_print_tensor_sum("embd", st->x, rt->cfg.dim);
+    }
+
+    if (rt->has_all_attn) {
+        for (int l = 0; l < rt->cfg.n_layers; l++) {
+            float sum_before_attn = 0.0f;
+            if (debug_mode && pos == 0) {
+                sum_before_attn = sum_f32(st->x, rt->cfg.dim);
+            }
+            apply_mla_attention_layer(rt, &rt->attn_layers[l], st, gs, pos, l, debug_mode);
+            float sum_before_ffn = 0.0f;
+            if (debug_mode && pos == 0) {
+                char name[32];
+                snprintf(name, sizeof(name), "Vcur-%d", l);
+                fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st->kv_a, rt->cfg.kv_lora_rank));
+                snprintf(name, sizeof(name), "kqv_out-%d", l);
+                fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st->att_concat, rt->cfg.n_heads * rt->cfg.l0_v_head_dim));
+                snprintf(name, sizeof(name), "ffn_inp-%d", l);
+                debug_print_tensor_sum(name, st->x, rt->cfg.dim);
+                snprintf(name, sizeof(name), "attn_out-%d", l);
+                fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st->x, rt->cfg.dim) - sum_before_attn);
+                sum_before_ffn = sum_f32(st->x, rt->cfg.dim);
+            }
+            if (l == 0) apply_l0_dense_ffn(rt, st, gs, debug_mode);
+            else apply_moe_shared_ffn_layer(rt, st, gs, l, debug_mode, pos);
+            if (debug_mode && pos == 0) {
+                char name[32];
+                snprintf(name, sizeof(name), "l_out-%d", l);
+                debug_print_tensor_sum(name, st->x, rt->cfg.dim);
+                snprintf(name, sizeof(name), "ffn_out-%d", l);
+                float ffn_out_sum = sum_f32(st->x, rt->cfg.dim) - sum_before_ffn;
+                fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, ffn_out_sum);
+            }
+        }
+        assert_finite_slice("attn_stack_out", st->x, rt->cfg.dim, debug_mode);
+    } else if (rt->has_l0_attn) {
+        apply_mla_attention_layer(rt, &l0_attn_weights, st, gs, pos, 0, debug_mode);
+        assert_finite_slice("l0_attn_out", st->x, rt->cfg.dim, debug_mode);
+        apply_l0_dense_ffn(rt, st, gs, debug_mode);
+        if (debug_mode && pos == 0) {
+            debug_print_tensor_sum("l_out-0", st->x, rt->cfg.dim);
+        }
+    } else {
+        apply_l0_dense_ffn(rt, st, gs, debug_mode);
+        if (debug_mode && pos == 0) {
+            debug_print_tensor_sum("l_out-0", st->x, rt->cfg.dim);
+        }
+    }
+    if (rt->has_l0_ffn) assert_finite_slice("l0_ffn_out", st->x, rt->cfg.dim, debug_mode);
+    rmsnorm(st->xn, st->x, rt->output_norm, rt->cfg.dim);
+    assert_finite_slice("final_rmsnorm", st->xn, rt->cfg.dim, debug_mode);
+    if (debug_mode && pos == 0) {
+        debug_print_tensor_sum("result_norm", st->xn, rt->cfg.dim);
+    }
+    matvec_rows(rt->out_q, rt->out_s, st->xn, st->logits, rt->cfg.vocab_size, rt->cfg.dim, gs);
+    assert_finite_slice("logits", st->logits, rt->cfg.vocab_size, debug_mode);
+    if (debug_mode && pos == 0) {
+        debug_print_tensor_sum("result_output", st->logits, rt->cfg.vocab_size);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
@@ -1576,6 +1760,8 @@ int main(int argc, char **argv) {
     int seed = -1;
     int debug_mode = 0;
     int self_test_tokenizer = 0;
+    int backend_set = 0;
+    BackendType backend = BACKEND_CPU;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
@@ -1587,10 +1773,27 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
         else if (strcmp(argv[i], "--debug") == 0) debug_mode = 1;
         else if (strcmp(argv[i], "--self-test-tokenizer") == 0) self_test_tokenizer = 1;
+        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "cpu") == 0) {
+                backend = BACKEND_CPU;
+                backend_set = 1;
+            } else if (strcmp(v, "metal") == 0) {
+                backend = BACKEND_METAL;
+                backend_set = 1;
+            } else {
+                fprintf(stderr, "Error: unknown backend '%s' (expected cpu|metal)\n", v);
+                return 1;
+            }
+        }
         else {
             usage(argv[0]);
             return 1;
         }
+    }
+    if (!backend_set) {
+        const char *env_backend = getenv("GLM_BACKEND");
+        if (env_backend && strcmp(env_backend, "metal") == 0) backend = BACKEND_METAL;
     }
     if (temperature < 0.0f) {
         fprintf(stderr, "Error: temperature must be >= 0.\n");
@@ -1630,6 +1833,7 @@ int main(int argc, char **argv) {
            rt.has_moe_routed ? "on" : "off",
            (rt.cfg.l0_flags & FLAG_NATIVE_COVERAGE_FULL) ? "full" : "partial");
     printf("  attn_layers_active=%d\n", rt.has_all_attn ? rt.cfg.n_layers : (rt.has_l0_attn ? 1 : 0));
+    printf("  backend=%s\n", backend == BACKEND_METAL ? "metal" : "cpu");
 
     if (self_test_tokenizer) {
         int pass = run_tokenizer_self_test(&tok, rt.cfg.bos_id);
@@ -1712,95 +1916,31 @@ int main(int argc, char **argv) {
 
     RunState st;
     runstate_build(&st, &rt, cache_cap);
+    int use_metal = 0;
+    if (backend == BACKEND_METAL) {
+#if !defined(__APPLE__)
+        fprintf(stderr, "[glm-metal] unavailable on this platform, using CPU backend\n");
+#else
+        if (glm_metal_init(&rt, &st) != 0) {
+            fprintf(stderr, "[glm-metal] init failed, falling back to CPU backend\n");
+        } else {
+            glm_metal_prepare(&rt, &st);
+            use_metal = 1;
+        }
+#endif
+    }
 
     int token = prompt_ids[0];
     if (token < 0 || token >= rt.cfg.vocab_size) token = 0;
     int prompt_index = 1;
     int generated = 0;
-    LayerAttnWeights l0_attn_weights = {
-        .attn_norm = rt.l0_attn_norm,
-        .q_a_norm = rt.l0_q_a_norm,
-        .kv_a_norm = rt.l0_kv_a_norm,
-        .q_a_q = rt.l0_q_a_q,
-        .q_a_s = rt.l0_q_a_s,
-        .q_b_q = rt.l0_q_b_q,
-        .q_b_s = rt.l0_q_b_s,
-        .kv_a_q = rt.l0_kv_a_q,
-        .kv_a_s = rt.l0_kv_a_s,
-        .k_b_q = rt.l0_k_b_q,
-        .k_b_s = rt.l0_k_b_s,
-        .v_b_q = rt.l0_v_b_q,
-        .v_b_s = rt.l0_v_b_s,
-        .attn_out_q = rt.l0_attn_out_q,
-        .attn_out_s = rt.l0_attn_out_s,
-    };
-
-    int gs = (int)rt.cfg.group_size;
-    int n_groups = rt.cfg.dim / gs;
     for (int pos = 0; pos < cache_cap; pos++) {
-        const int8_t *eq = rt.tok_q + (size_t)token * rt.cfg.dim;
-        const float *es = rt.tok_s + (size_t)token * n_groups;
-        dequant_row_q80(eq, es, st.x, rt.cfg.dim, gs);
-        assert_finite_slice("embed", st.x, rt.cfg.dim, 0);
-        if (debug_mode && pos == 0) {
-            debug_print_tensor_sum("embd", st.x, rt.cfg.dim);
-        }
-
-        if (rt.has_all_attn) {
-            for (int l = 0; l < rt.cfg.n_layers; l++) {
-                float sum_before_attn = 0.0f;
-                if (debug_mode && pos == 0) {
-                    sum_before_attn = sum_f32(st.x, rt.cfg.dim);
-                }
-                apply_mla_attention_layer(&rt, &rt.attn_layers[l], &st, gs, pos, l);
-                float sum_before_ffn = 0.0f;
-                if (debug_mode && pos == 0) {
-                    char name[32];
-                    snprintf(name, sizeof(name), "Vcur-%d", l);
-                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st.kv_a, rt.cfg.kv_lora_rank));
-                    snprintf(name, sizeof(name), "kqv_out-%d", l);
-                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st.att_concat, rt.cfg.n_heads * rt.cfg.l0_v_head_dim));
-                    snprintf(name, sizeof(name), "ffn_inp-%d", l);
-                    debug_print_tensor_sum(name, st.x, rt.cfg.dim);
-                    snprintf(name, sizeof(name), "attn_out-%d", l);
-                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, sum_f32(st.x, rt.cfg.dim) - sum_before_attn);
-                    sum_before_ffn = sum_f32(st.x, rt.cfg.dim);
-                }
-                if (l == 0) apply_l0_dense_ffn(&rt, &st, gs);
-                else apply_moe_shared_ffn_layer(&rt, &st, gs, l, debug_mode, pos);
-                if (debug_mode && pos == 0) {
-                    char name[32];
-                    snprintf(name, sizeof(name), "l_out-%d", l);
-                    debug_print_tensor_sum(name, st.x, rt.cfg.dim);
-                    snprintf(name, sizeof(name), "ffn_out-%d", l);
-                    float ffn_out_sum = sum_f32(st.x, rt.cfg.dim) - sum_before_ffn;
-                    fprintf(stderr, "[glm-layer-sum] %s sum=%.6f\n", name, ffn_out_sum);
-                }
-            }
-            assert_finite_slice("attn_stack_out", st.x, rt.cfg.dim, 0);
-        } else if (rt.has_l0_attn) {
-            apply_mla_attention_layer(&rt, &l0_attn_weights, &st, gs, pos, 0);
-            assert_finite_slice("l0_attn_out", st.x, rt.cfg.dim, 0);
-            apply_l0_dense_ffn(&rt, &st, gs);
-            if (debug_mode && pos == 0) {
-                debug_print_tensor_sum("l_out-0", st.x, rt.cfg.dim);
-            }
-        } else {
-            apply_l0_dense_ffn(&rt, &st, gs);
-            if (debug_mode && pos == 0) {
-                debug_print_tensor_sum("l_out-0", st.x, rt.cfg.dim);
-            }
-        }
-        if (rt.has_l0_ffn) assert_finite_slice("l0_ffn_out", st.x, rt.cfg.dim, 0);
-        rmsnorm(st.xn, st.x, rt.output_norm, rt.cfg.dim);
-        assert_finite_slice("final_rmsnorm", st.xn, rt.cfg.dim, 0);
-        if (debug_mode && pos == 0) {
-            debug_print_tensor_sum("result_norm", st.xn, rt.cfg.dim);
-        }
-        matvec_q80_rows(rt.out_q, rt.out_s, st.xn, st.logits, rt.cfg.vocab_size, rt.cfg.dim, gs);
-        assert_finite_slice("logits", st.logits, rt.cfg.vocab_size, 0);
-        if (debug_mode && pos == 0) {
-            debug_print_tensor_sum("result_output", st.logits, rt.cfg.vocab_size);
+        int fwd_status = use_metal
+            ? glm_metal_forward_token(&rt, &st, token, pos, debug_mode)
+            : glm_cpu_forward_token(&rt, &st, token, pos, debug_mode);
+        if (fwd_status != 0) {
+            fprintf(stderr, "[error] forward failed at pos=%d\n", pos);
+            break;
         }
         if (debug_mode && prompt_index >= n_prompt && generated == 0) {
             print_topk_debug(st.logits, &tok, rt.cfg.vocab_size, 5);
@@ -1822,6 +1962,7 @@ int main(int argc, char **argv) {
     }
     putchar('\n');
 
+    if (use_metal) glm_metal_free();
     free(prompt_ids);
     free(prompt_file_buf);
     runstate_free(&st);

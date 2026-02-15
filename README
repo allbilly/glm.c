@@ -1,9 +1,74 @@
- ./glm4.7-flash GLM-4.7-Flash.bin -n 16 -t 0 --seed 0 -i "Hello i am batman. My name is"
-[glm4.7-flash] loaded checkpoint
-  dim=2048 layers=47 heads=20 kv_heads=1 vocab=154880 seq_len=202752
-  mode=completion version=4
-  forward=embed+mla_attn_all+l0_dense_ffn+moe_shared_ffn+moe_routed+final_norm+lm_head
-  blocks: l0_attn=on all_attn=on l0_ffn=on moe_shared=on moe_routed=on native_coverage=partial
-  attn_layers_active=47
-Hello i am batman. My name is
-BruceWayne.IamtheCEOofWayneEntertainment.Iamthefound
+# glm.c (GLM-4.7-Flash)
+
+## TPS benchmark
+
+Method used below:
+
+- `glm4.7-flash`: end-to-end wall-clock timing with `/usr/bin/time -p` for 16 generated tokens.
+- `llama.cpp`: `llama-bench` decode throughput (`n_gen=16`, `r=1`).
+
+One-shot benchmark (runs all four modes):
+
+```sh
+make bench-tps
+```
+
+OpenMP CPU thread sweep (glm.c CPU only):
+
+```sh
+make bench-tps-omp
+```
+
+Tune defaults if needed:
+
+```sh
+make bench-tps BENCH_OMP_THREADS=8
+make bench-tps-omp BENCH_OMP_THREAD_LIST="1 2 4 8 10"
+```
+
+### Repro commands
+
+glm.c CPU:
+
+```sh
+/usr/bin/time -p ./glm4.7-flash ./GLM-4.7-Flash.bin --backend cpu -n 16 -t 0 --seed 0 -i "1+1=" > /tmp/glm_tps_glm-cpu.txt
+```
+
+glm.c Metal:
+
+```sh
+/usr/bin/time -p ./glm4.7-flash ./GLM-4.7-Flash.bin --backend metal -n 16 -t 0 --seed 0 -i "1+1=" > /tmp/glm_tps_glm-metal.txt
+```
+
+llama.cpp CPU:
+
+```sh
+/opt/homebrew/bin/llama-bench -m ./GLM-4.7-Flash-Q4_K_M.gguf -ngl 0 -p 1 -n 16 -r 1 -o json > /tmp/glm_tps_llama-bench-cpu.json
+```
+
+llama.cpp Metal:
+
+```sh
+/opt/homebrew/bin/llama-bench -m ./GLM-4.7-Flash-Q4_K_M.gguf -ngl 99 -p 1 -n 16 -r 1 -o json > /tmp/glm_tps_llama-bench-metal.json
+```
+
+### Latest sample results (Apple M4)
+
+| Mode | Tokens | tok/s |
+| --- | ---: | ---: |
+| glm.c CPU | 16 | 1.949 |
+| glm.c Metal | 16 | 4.156 |
+| llama.cpp CPU (`llama-bench`, `n_gen=16`) | 16 | 8.357 |
+| llama.cpp Metal (`llama-bench`, `n_gen=16`) | 16 | 24.701 |
+
+## Kernel locations
+
+llama.cpp (Metal kernels):
+
+- Standalone Metal kernel source:
+  - `/Users/mj/Desktop/glm.c/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`
+- Metal backend integration:
+  - `/Users/mj/Desktop/glm.c/llama.cpp/ggml/src/ggml-metal/ggml-metal.cpp`
+  - `/Users/mj/Desktop/glm.c/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp`
+  - `/Users/mj/Desktop/glm.c/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m`
+  - `/Users/mj/Desktop/glm.c/llama.cpp/ggml/include/ggml-metal.h`
