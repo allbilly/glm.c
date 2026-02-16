@@ -13,10 +13,23 @@ One-shot benchmark (runs all four modes):
 make bench-tps
 ```
 
+Separate backend benchmarks:
+
+```sh
+make bench-tps-cpu
+make bench-tps-metal
+```
+
 OpenMP CPU thread sweep (glm.c CPU only):
 
 ```sh
 make bench-tps-omp
+```
+
+BLAS/AMX info:
+
+```sh
+make blas-info
 ```
 
 Tune defaults if needed:
@@ -24,6 +37,33 @@ Tune defaults if needed:
 ```sh
 make bench-tps BENCH_OMP_THREADS=8
 make bench-tps-omp BENCH_OMP_THREAD_LIST="1 2 4 8 10"
+make build BLAS=accelerate
+make build BLAS=openblas
+```
+
+## Metal backend status
+
+- Metal/backend glue was split out of `infer.c` into `backend.c`.
+- `infer.c` now runs CPU math only (no direct or indirect matvec offload calls into Metal from that file).
+- Metal backend execution is isolated behind backend modules (`backend.c` and `infer.m`).
+- Current Metal path is still hybrid and calls `glm_cpu_forward_token` from `infer.m`; full GPU-native layer orchestration is future work.
+- Existing tuning env (kept for backend experimentation):
+
+```sh
+GLM_METAL_MATVEC_MIN_ROWS=1 ./glm4.7-flash ./GLM-4.7-Flash.bin --backend metal -n 16 -t 0 --seed 0 -i "1+1="
+```
+
+## Apple AMX and BLAS
+
+- Apple AMX is not directly exposed as public C intrinsics for this project.
+- On Apple Silicon, using `Accelerate` (Apple BLAS) is the practical way to get AMX-backed CPU math where applicable.
+- In this repo, BLAS acceleration is wired for dense float ops (`dot_f32`, `matvec_f32_rows`) and selected automatically on macOS.
+- Select BLAS backend at build time:
+
+```sh
+make build BLAS=accelerate   # Apple BLAS / AMX path on macOS
+make build BLAS=openblas     # OpenBLAS (if installed)
+make build BLAS=none         # disable BLAS
 ```
 
 ### Repro commands
@@ -56,10 +96,10 @@ llama.cpp Metal:
 
 | Mode | Tokens | tok/s |
 | --- | ---: | ---: |
-| glm.c CPU | 16 | 1.949 |
-| glm.c Metal | 16 | 4.156 |
-| llama.cpp CPU (`llama-bench`, `n_gen=16`) | 16 | 8.357 |
-| llama.cpp Metal (`llama-bench`, `n_gen=16`) | 16 | 24.701 |
+| glm.c CPU | 16 | 2.941 |
+| glm.c Metal | 16 | 2.957 |
+| llama.cpp CPU (`llama-bench`, `n_gen=16`) | 16 | 9.493 |
+| llama.cpp Metal (`llama-bench`, `n_gen=16`) | 16 | 25.040 |
 
 ## Kernel locations
 

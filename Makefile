@@ -3,8 +3,10 @@ CFLAGS ?= -O3 -D_FILE_OFFSET_BITS=64
 LDFLAGS ?= -lm
 UNAME_S := $(shell uname -s)
 PROJECT_ROOT := $(abspath .)
+MODEL_DIR ?= $(PROJECT_ROOT)/model
 OPENMP_PREFIX ?= /opt/homebrew/opt/libomp
-OPENMP_MODE ?= $(shell tmpc=/tmp/glm_openmp_probe_$$.c; tmpx=/tmp/glm_openmp_probe_$$.bin; \
+ifndef OPENMP_MODE
+OPENMP_MODE := $(shell tmpc=/tmp/glm_openmp_probe_$$.c; tmpx=/tmp/glm_openmp_probe_$$.bin; \
 	printf 'int main(void){return 0;}\n' > $$tmpc; \
 	if $(CC) -fopenmp $$tmpc -o $$tmpx >/dev/null 2>&1; then \
 		echo native; \
@@ -14,21 +16,50 @@ OPENMP_MODE ?= $(shell tmpc=/tmp/glm_openmp_probe_$$.c; tmpx=/tmp/glm_openmp_pro
 		echo none; \
 	fi; \
 	rm -f $$tmpc $$tmpx)
-
-ifeq ($(OPENMP_MODE),native)
-OPENMP_CFLAGS ?= -fopenmp
-OPENMP_LDFLAGS ?= -fopenmp
-else ifeq ($(OPENMP_MODE),apple-libomp)
-OPENMP_CFLAGS ?= -Xpreprocessor -fopenmp -I$(OPENMP_PREFIX)/include
-OPENMP_LDFLAGS ?= -L$(OPENMP_PREFIX)/lib -lomp
-else
-OPENMP_CFLAGS ?=
-OPENMP_LDFLAGS ?=
 endif
 
-NATIVE_MODEL ?= $(PROJECT_ROOT)/GLM-4.7-Flash.bin
-GGUF_MODEL ?= $(PROJECT_ROOT)/GLM-4.7-Flash-Q4_K_M.gguf
+ifeq ($(OPENMP_MODE),native)
+OPENMP_CFLAGS := -fopenmp
+OPENMP_LDFLAGS := -fopenmp
+else ifeq ($(OPENMP_MODE),apple-libomp)
+OPENMP_CFLAGS := -Xpreprocessor -fopenmp -I$(OPENMP_PREFIX)/include
+OPENMP_LDFLAGS := -L$(OPENMP_PREFIX)/lib -lomp
+else
+OPENMP_CFLAGS :=
+OPENMP_LDFLAGS :=
+endif
+
+BLAS ?= auto
+ifeq ($(BLAS),auto)
+ifeq ($(UNAME_S),Darwin)
+BLAS_MODE := accelerate
+else
+BLAS_MODE := $(shell pkg-config --exists openblas && echo openblas || echo none)
+endif
+else
+BLAS_MODE := $(BLAS)
+endif
+
+ifeq ($(BLAS_MODE),accelerate)
+BLAS_CFLAGS := -DGLM_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+BLAS_LDFLAGS := -framework Accelerate
+else ifeq ($(BLAS_MODE),openblas)
+BLAS_CFLAGS := -DGLM_USE_CBLAS $(shell pkg-config --cflags openblas 2>/dev/null)
+BLAS_LDFLAGS := $(shell pkg-config --libs openblas 2>/dev/null)
+ifeq ($(strip $(BLAS_LDFLAGS)),)
+BLAS_LDFLAGS := -lopenblas
+endif
+else
+BLAS_CFLAGS :=
+BLAS_LDFLAGS :=
+endif
+
+NATIVE_MODEL ?= $(MODEL_DIR)/GLM-4.7-Flash.bin
+GGUF_MODEL ?= $(MODEL_DIR)/GLM-4.7-Flash-Q4_K_M.gguf
 REF_MODEL ?= $(GGUF_MODEL)
+
+APP_SOURCES := main.c infer.c backend.c
+METAL_SOURCES := $(APP_SOURCES) infer.m
 
 LLAMA_CLI ?= /opt/homebrew/bin/llama-cli
 LLAMA_TOKENIZE ?= /opt/homebrew/bin/llama-tokenize
@@ -46,8 +77,8 @@ BENCH_OMP_PROC_BIND ?= true
 BENCH_OMP_PLACES ?= cores
 
 .PHONY: build
-build: glm4.7-flash.c
-	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) -o glm4.7-flash glm4.7-flash.c $(LDFLAGS) $(OPENMP_LDFLAGS)
+build: $(APP_SOURCES)
+	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -o glm4.7-flash $(APP_SOURCES) $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
 
 .PHONY: openmp-info
 openmp-info:
@@ -58,6 +89,17 @@ openmp-info:
 		echo "OpenMP is not active for CC='$(CC)'"; \
 		echo "macOS quick fix: brew install libomp"; \
 		echo "Then run: make build CC=cc"; \
+	fi
+
+.PHONY: blas-info
+blas-info:
+	@echo "BLAS_MODE=$(BLAS_MODE)"
+	@echo "BLAS_CFLAGS=$(BLAS_CFLAGS)"
+	@echo "BLAS_LDFLAGS=$(BLAS_LDFLAGS)"
+	@if [ "$(BLAS_MODE)" = "none" ]; then \
+		echo "BLAS disabled. Use one of:"; \
+		echo "  make build BLAS=accelerate"; \
+		echo "  make build BLAS=openblas"; \
 	fi
 
 ifeq ($(UNAME_S),Darwin)
@@ -75,13 +117,13 @@ check-metal-toolchain:
 		(echo "missing Metal toolchain; run 'make metal-prereqs' and retry" && exit 1)
 
 .PHONY: metal-lib
-metal-lib: check-metal-toolchain glm4.7-flash.metal
-	xcrun -sdk macosx metal -std=metal3.0 -O0 -c glm4.7-flash.metal -o glm4.7-flash.air
-	xcrun -sdk macosx metallib glm4.7-flash.air -o glm4.7-flash.metallib
+metal-lib: check-metal-toolchain infer.metal
+	xcrun -sdk macosx metal -std=metal3.0 -O0 -c infer.metal -o infer.air
+	xcrun -sdk macosx metallib infer.air -o infer.metallib
 
 .PHONY: build-metal
-build-metal: metal-lib glm4.7-flash.c glm4.7-flash.m
-	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) -DGLM_ENABLE_METAL=1 -x objective-c -fobjc-arc -o glm4.7-flash glm4.7-flash.c glm4.7-flash.m -framework Foundation -framework Metal $(LDFLAGS) $(OPENMP_LDFLAGS)
+build-metal: metal-lib $(METAL_SOURCES)
+	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -DGLM_ENABLE_METAL=1 -x objective-c -fobjc-arc -o glm4.7-flash $(METAL_SOURCES) -framework Foundation -framework Metal $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
 else
 .PHONY: metal-prereqs
 metal-prereqs:
@@ -277,6 +319,38 @@ bench-tps: build-metal
 	printf "%-22s %8s\n" "llama.cpp metal" "$$llama_metal_tps"; \
 	echo "[artifacts] $$glm_cpu_out $$glm_cpu_time $$glm_metal_out $$glm_metal_time $$llama_cpu_json $$llama_metal_json"
 
+.PHONY: bench-tps-cpu
+bench-tps-cpu: build
+	@set -e; \
+	tokens="$(BENCH_TOKENS)"; \
+	prompt="$(BENCH_PROMPT)"; \
+	out=/tmp/glm_tps_glm-cpu.txt; \
+	timef=/tmp/glm_tps_glm-cpu.time.txt; \
+	if [ "$(BENCH_WARMUP)" = "1" ]; then \
+		env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+			./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
+	fi; \
+	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+		/usr/bin/time -p ./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$timef); \
+	echo "glm.c cpu tok/s=$$tps (omp=$(BENCH_OMP_THREADS), tokens=$$tokens)"; \
+	echo "[artifacts] $$out $$timef"
+
+.PHONY: bench-tps-metal
+bench-tps-metal: build-metal
+	@set -e; \
+	tokens="$(BENCH_TOKENS)"; \
+	prompt="$(BENCH_PROMPT)"; \
+	out=/tmp/glm_tps_glm-metal.txt; \
+	timef=/tmp/glm_tps_glm-metal.time.txt; \
+	if [ "$(BENCH_WARMUP)" = "1" ]; then \
+		./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
+	fi; \
+	/usr/bin/time -p ./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$timef); \
+	echo "glm.c metal tok/s=$$tps (tokens=$$tokens)"; \
+	echo "[artifacts] $$out $$timef"
+
 .PHONY: bench-tps-omp
 bench-tps-omp: build
 	@set -e; \
@@ -297,3 +371,7 @@ bench-tps-omp: build
 		printf "%-8s %8s\n" $$t $$tps; \
 	done; \
 	echo "[artifacts] /tmp/glm_tps_glm-cpu-omp-t*.txt /tmp/glm_tps_glm-cpu-omp-t*.time.txt"
+
+.PHONY: clean
+clean:
+	rm -f glm4.7-flash infer.air infer.metallib glm4.7-flash.air glm4.7-flash.metallib /tmp/glm_tps_glm-*.txt /tmp/glm_tps_glm-*.time.txt

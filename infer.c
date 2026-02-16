@@ -6,8 +6,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "backend.h"
+
 #if defined(_OPENMP)
 #include <omp.h>
+#endif
+
+#if defined(GLM_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#define GLM_HAS_CBLAS 1
+#elif defined(GLM_USE_CBLAS)
+#include <cblas.h>
+#define GLM_HAS_CBLAS 1
+#else
+#define GLM_HAS_CBLAS 0
 #endif
 
 #if defined _WIN32
@@ -28,85 +40,6 @@
 #define FLAG_NATIVE_COVERAGE_FULL 2
 
 typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    int32_t dim;
-    int32_t hidden_dim;
-    int32_t n_layers;
-    int32_t n_heads;
-    int32_t n_kv_heads;
-    int32_t vocab_size;
-    int32_t seq_len;
-    int32_t rope_dim;
-    int32_t q_lora_rank;
-    int32_t kv_lora_rank;
-    int32_t kv_mqa_width;
-    int32_t n_routed_experts;
-    int32_t n_experts_used;
-    int32_t n_shared_experts;
-    int32_t bos_id;
-    int32_t eos_id;
-    uint64_t group_size;
-    uint64_t off_norm;
-    uint64_t off_tok_q;
-    uint64_t off_tok_s;
-    uint64_t off_out_q;
-    uint64_t off_out_s;
-    uint64_t total_bytes;
-    uint64_t off_l0_ffn_norm;
-    uint64_t off_l0_ffn_gate_q;
-    uint64_t off_l0_ffn_gate_s;
-    uint64_t off_l0_ffn_up_q;
-    uint64_t off_l0_ffn_up_s;
-    uint64_t off_l0_ffn_down_q;
-    uint64_t off_l0_ffn_down_s;
-    int32_t l0_qk_nope_dim;
-    int32_t l0_head_k_dim;
-    int32_t l0_v_head_dim;
-    int32_t l0_flags;
-    int32_t moe_ffn_dim;
-} RuntimeConfig;
-
-typedef struct {
-    const float *attn_norm;     // [dim]
-    const float *q_a_norm;      // [q_lora_rank]
-    const float *kv_a_norm;     // [kv_lora_rank]
-    const int8_t *q_a_q;        // [q_lora_rank, dim]
-    const float *q_a_s;         // [q_lora_rank, dim/gs]
-    const int8_t *q_b_q;        // [n_heads*head_k, q_lora_rank]
-    const float *q_b_s;         // [n_heads*head_k, q_lora_rank/gs]
-    const int8_t *kv_a_q;       // [kv_lora_rank + rope_dim, dim]
-    const float *kv_a_s;        // [kv_lora_rank + rope_dim, dim/gs]
-    const int8_t *k_b_q;        // [n_heads*kv_lora_rank, qk_nope]
-    const float *k_b_s;         // [n_heads*kv_lora_rank, qk_nope/gs]
-    const int8_t *v_b_q;        // [n_heads*v_head, kv_lora_rank]
-    const float *v_b_s;         // [n_heads*v_head, kv_lora_rank/gs]
-    const int8_t *attn_out_q;   // [dim, n_heads*v_head]
-    const float *attn_out_s;    // [dim, (n_heads*v_head)/gs]
-} LayerAttnWeights;
-
-typedef struct {
-    const float *ffn_norm;      // [dim]
-    const float *gate_inp;      // [n_routed_experts, dim]
-    const float *exp_probs_b;   // [n_routed_experts]
-    const int8_t *gate_sh_q;    // [moe_ffn_dim, dim]
-    const float *gate_sh_s;     // [moe_ffn_dim, dim/gs]
-    const int8_t *up_sh_q;      // [moe_ffn_dim, dim]
-    const float *up_sh_s;       // [moe_ffn_dim, dim/gs]
-    const int8_t *down_sh_q;    // [dim, moe_ffn_dim]
-    const float *down_sh_s;     // [dim, moe_ffn_dim/gs]
-} LayerMoeShared;
-
-typedef struct {
-    const int8_t *gate_q;       // [n_routed_experts*moe_ffn_dim, dim]
-    const float *gate_s;        // [n_routed_experts*moe_ffn_dim, dim/gs]
-    const int8_t *up_q;         // [n_routed_experts*moe_ffn_dim, dim]
-    const float *up_s;          // [n_routed_experts*moe_ffn_dim, dim/gs]
-    const int8_t *down_q;       // [n_routed_experts*dim, moe_ffn_dim]
-    const float *down_s;        // [n_routed_experts*dim, moe_ffn_dim/gs]
-} LayerMoeRouted;
-
-typedef struct {
     char *bytes;
     uint32_t len;
 } Token;
@@ -123,114 +56,9 @@ typedef struct {
     int16_t cp_to_byte[512];
 } Tokenizer;
 
-typedef struct {
-    RuntimeConfig cfg;
-    unsigned char *data;
-    size_t file_size;
-
-    const float *output_norm;      // [dim]
-    const int8_t *tok_q;           // [vocab, dim]
-    const float *tok_s;            // [vocab, dim/gs]
-    const int8_t *out_q;           // [vocab, dim]
-    const float *out_s;            // [vocab, dim/gs]
-
-    int has_l0_ffn;
-    const float *l0_ffn_norm;      // [dim]
-    const int8_t *l0_ffn_gate_q;   // [hidden_dim, dim]
-    const float *l0_ffn_gate_s;    // [hidden_dim, dim/gs]
-    const int8_t *l0_ffn_up_q;     // [hidden_dim, dim]
-    const float *l0_ffn_up_s;      // [hidden_dim, dim/gs]
-    const int8_t *l0_ffn_down_q;   // [dim, hidden_dim]
-    const float *l0_ffn_down_s;    // [dim, hidden_dim/gs]
-
-    int has_l0_attn;
-    const float *l0_attn_norm;     // [dim]
-    const float *l0_q_a_norm;      // [q_lora_rank]
-    const float *l0_kv_a_norm;     // [kv_lora_rank]
-    const int8_t *l0_q_a_q;        // [q_lora_rank, dim]
-    const float *l0_q_a_s;         // [q_lora_rank, dim/gs]
-    const int8_t *l0_q_b_q;        // [n_heads*head_k, q_lora_rank]
-    const float *l0_q_b_s;         // [n_heads*head_k, q_lora_rank/gs]
-    const int8_t *l0_kv_a_q;       // [kv_lora_rank + rope_dim, dim]
-    const float *l0_kv_a_s;        // [kv_lora_rank + rope_dim, dim/gs]
-    const int8_t *l0_k_b_q;        // [n_heads*kv_lora_rank, qk_nope]
-    const float *l0_k_b_s;         // [n_heads*kv_lora_rank, qk_nope/gs]
-    const int8_t *l0_v_b_q;        // [n_heads*v_head, kv_lora_rank]
-    const float *l0_v_b_s;         // [n_heads*v_head, kv_lora_rank/gs]
-    const int8_t *l0_attn_out_q;   // [dim, n_heads*v_head]
-    const float *l0_attn_out_s;    // [dim, (n_heads*v_head)/gs]
-
-    int has_all_attn;
-    LayerAttnWeights *attn_layers; // [n_layers] when present
-
-    int has_moe_shared;
-    LayerMoeShared *moe_layers; // [n_layers], layers 1..n_layers-1 populated
-    int has_moe_routed;
-    LayerMoeRouted *moe_routed_layers; // [n_layers], layers 1..n_layers-1 populated
-} Runtime;
-
-typedef struct {
-    float *x;       // [dim]
-    float *xn;      // [dim]
-    float *xb;      // [dim]
-    float *ff_gate; // [hidden_dim]
-    float *ff_up;   // [hidden_dim]
-    float *logits;  // [vocab]
-
-    int cache_cap;
-    int n_attn_layers;
-    float *k_cache_comp;   // [n_attn_layers, cache_cap, kv_lora_rank]
-    float *k_cache_pe;     // [n_attn_layers, cache_cap, rope_dim]
-    float *q_a;            // [q_lora_rank]
-    float *q_full;         // [n_heads*head_k]
-    float *kv_a;           // [kv_lora_rank + rope_dim]
-    float *q_nope;         // [qk_nope_dim]
-    float *q_pe;           // [rope_dim]
-    float *q_abs;          // [kv_lora_rank]
-    float *att_scores;     // [cache_cap]
-    float *att_ctx;        // [kv_lora_rank]
-    float *att_concat;     // [n_heads*v_head]
-    float *moe_gate;       // [moe_ffn_dim]
-    float *moe_up;         // [moe_ffn_dim]
-    float *moe_router;     // [n_routed_experts]
-    float *moe_out_acc;    // [dim]
-    int *moe_topk_idx;     // [n_experts_used]
-    float *moe_topk_w;     // [n_experts_used]
-} RunState;
-
-typedef enum {
-    BACKEND_CPU = 0,
-    BACKEND_METAL = 1,
-} BackendType;
 
 static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids, int max_ids, int bos);
 static void assert_finite_slice(const char *name, const float *x, int n, int debug_mode);
-
-#if defined(__APPLE__) && defined(GLM_ENABLE_METAL)
-int glm_metal_init(const Runtime *rt, RunState *st);
-void glm_metal_prepare(const Runtime *rt, RunState *st);
-int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode);
-void glm_metal_free(void);
-#else
-static int glm_metal_init(const Runtime *rt, RunState *st) {
-    (void)rt;
-    (void)st;
-    return -1;
-}
-static void glm_metal_prepare(const Runtime *rt, RunState *st) {
-    (void)rt;
-    (void)st;
-}
-static int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode) {
-    (void)rt;
-    (void)st;
-    (void)token;
-    (void)pos;
-    (void)debug_mode;
-    return -1;
-}
-static void glm_metal_free(void) {}
-#endif
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -1043,9 +871,27 @@ static float silu(float x) {
 }
 
 static float dot_f32(const float *a, const float *b, int n) {
+#if GLM_HAS_CBLAS
+    if (n >= 128) {
+        return cblas_sdot(n, a, 1, b, 1);
+    }
+#endif
     float s = 0.0f;
     for (int i = 0; i < n; i++) s += a[i] * b[i];
     return s;
+}
+
+static void matvec_f32_rows(const float *a, const float *x, float *y, int rows, int cols) {
+#if GLM_HAS_CBLAS
+    if (rows > 0 && cols > 0) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, rows, cols, 1.0f, a, cols, x, 1, 0.0f, y, 1);
+        return;
+    }
+#endif
+    for (int r = 0; r < rows; r++) {
+        const float *row = a + (size_t)r * (size_t)cols;
+        y[r] = dot_f32(row, x, cols);
+    }
 }
 
 static float sum_f32(const float *x, int n) {
@@ -1211,9 +1057,9 @@ static void apply_moe_shared_ffn_layer(const Runtime *rt, RunState *s, int gs, i
 
     // Router probabilities for routed experts. For DeepSeek2, expert selection uses
     // probs + exp_probs_b, but expert weights themselves remain unbiased probs.
+    matvec_f32_rows(w->gate_inp, s->xn, s->moe_router, n_routed, dim);
     for (int e = 0; e < n_routed; e++) {
-        const float *gw = w->gate_inp + (size_t)e * (size_t)dim;
-        float logit = dot_f32(gw, s->xn, dim);
+        float logit = s->moe_router[e];
         s->moe_router[e] = 1.0f / (1.0f + expf(-logit)); // sigmoid gating
     }
     assert_finite_slice("moe_router", s->moe_router, n_routed, debug_mode);
@@ -1744,7 +1590,7 @@ int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, i
     return 0;
 }
 
-int main(int argc, char **argv) {
+int glm_app_main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -1916,28 +1762,14 @@ int main(int argc, char **argv) {
 
     RunState st;
     runstate_build(&st, &rt, cache_cap);
-    int use_metal = 0;
-    if (backend == BACKEND_METAL) {
-#if !defined(__APPLE__)
-        fprintf(stderr, "[glm-metal] unavailable on this platform, using CPU backend\n");
-#else
-        if (glm_metal_init(&rt, &st) != 0) {
-            fprintf(stderr, "[glm-metal] init failed, falling back to CPU backend\n");
-        } else {
-            glm_metal_prepare(&rt, &st);
-            use_metal = 1;
-        }
-#endif
-    }
+    int use_metal = glm_backend_init(backend, &rt, &st);
 
     int token = prompt_ids[0];
     if (token < 0 || token >= rt.cfg.vocab_size) token = 0;
     int prompt_index = 1;
     int generated = 0;
     for (int pos = 0; pos < cache_cap; pos++) {
-        int fwd_status = use_metal
-            ? glm_metal_forward_token(&rt, &st, token, pos, debug_mode)
-            : glm_cpu_forward_token(&rt, &st, token, pos, debug_mode);
+        int fwd_status = glm_backend_forward_token(use_metal, &rt, &st, token, pos, debug_mode);
         if (fwd_status != 0) {
             fprintf(stderr, "[error] forward failed at pos=%d\n", pos);
             break;
@@ -1962,7 +1794,7 @@ int main(int argc, char **argv) {
     }
     putchar('\n');
 
-    if (use_metal) glm_metal_free();
+    glm_backend_free(use_metal);
     free(prompt_ids);
     free(prompt_file_buf);
     runstate_free(&st);

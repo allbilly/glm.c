@@ -7,161 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    int32_t dim;
-    int32_t hidden_dim;
-    int32_t n_layers;
-    int32_t n_heads;
-    int32_t n_kv_heads;
-    int32_t vocab_size;
-    int32_t seq_len;
-    int32_t rope_dim;
-    int32_t q_lora_rank;
-    int32_t kv_lora_rank;
-    int32_t kv_mqa_width;
-    int32_t n_routed_experts;
-    int32_t n_experts_used;
-    int32_t n_shared_experts;
-    int32_t bos_id;
-    int32_t eos_id;
-    uint64_t group_size;
-    uint64_t off_norm;
-    uint64_t off_tok_q;
-    uint64_t off_tok_s;
-    uint64_t off_out_q;
-    uint64_t off_out_s;
-    uint64_t total_bytes;
-    uint64_t off_l0_ffn_norm;
-    uint64_t off_l0_ffn_gate_q;
-    uint64_t off_l0_ffn_gate_s;
-    uint64_t off_l0_ffn_up_q;
-    uint64_t off_l0_ffn_up_s;
-    uint64_t off_l0_ffn_down_q;
-    uint64_t off_l0_ffn_down_s;
-    int32_t l0_qk_nope_dim;
-    int32_t l0_head_k_dim;
-    int32_t l0_v_head_dim;
-    int32_t l0_flags;
-    int32_t moe_ffn_dim;
-} RuntimeConfig;
-
-typedef struct {
-    const float *attn_norm;
-    const float *q_a_norm;
-    const float *kv_a_norm;
-    const int8_t *q_a_q;
-    const float *q_a_s;
-    const int8_t *q_b_q;
-    const float *q_b_s;
-    const int8_t *kv_a_q;
-    const float *kv_a_s;
-    const int8_t *k_b_q;
-    const float *k_b_s;
-    const int8_t *v_b_q;
-    const float *v_b_s;
-    const int8_t *attn_out_q;
-    const float *attn_out_s;
-} LayerAttnWeights;
-
-typedef struct {
-    const float *ffn_norm;
-    const float *gate_inp;
-    const float *exp_probs_b;
-    const int8_t *gate_sh_q;
-    const float *gate_sh_s;
-    const int8_t *up_sh_q;
-    const float *up_sh_s;
-    const int8_t *down_sh_q;
-    const float *down_sh_s;
-} LayerMoeShared;
-
-typedef struct {
-    const int8_t *gate_q;
-    const float *gate_s;
-    const int8_t *up_q;
-    const float *up_s;
-    const int8_t *down_q;
-    const float *down_s;
-} LayerMoeRouted;
-
-typedef struct {
-    RuntimeConfig cfg;
-    unsigned char *data;
-    size_t file_size;
-
-    const float *output_norm;
-    const int8_t *tok_q;
-    const float *tok_s;
-    const int8_t *out_q;
-    const float *out_s;
-
-    int has_l0_ffn;
-    const float *l0_ffn_norm;
-    const int8_t *l0_ffn_gate_q;
-    const float *l0_ffn_gate_s;
-    const int8_t *l0_ffn_up_q;
-    const float *l0_ffn_up_s;
-    const int8_t *l0_ffn_down_q;
-    const float *l0_ffn_down_s;
-
-    int has_l0_attn;
-    const float *l0_attn_norm;
-    const float *l0_q_a_norm;
-    const float *l0_kv_a_norm;
-    const int8_t *l0_q_a_q;
-    const float *l0_q_a_s;
-    const int8_t *l0_q_b_q;
-    const float *l0_q_b_s;
-    const int8_t *l0_kv_a_q;
-    const float *l0_kv_a_s;
-    const int8_t *l0_k_b_q;
-    const float *l0_k_b_s;
-    const int8_t *l0_v_b_q;
-    const float *l0_v_b_s;
-    const int8_t *l0_attn_out_q;
-    const float *l0_attn_out_s;
-
-    int has_all_attn;
-    LayerAttnWeights *attn_layers;
-
-    int has_moe_shared;
-    LayerMoeShared *moe_layers;
-    int has_moe_routed;
-    LayerMoeRouted *moe_routed_layers;
-} Runtime;
-
-typedef struct {
-    float *x;
-    float *xn;
-    float *xb;
-    float *ff_gate;
-    float *ff_up;
-    float *logits;
-
-    int cache_cap;
-    int n_attn_layers;
-    float *k_cache_comp;
-    float *k_cache_pe;
-    float *q_a;
-    float *q_full;
-    float *kv_a;
-    float *q_nope;
-    float *q_pe;
-    float *q_abs;
-    float *att_scores;
-    float *att_ctx;
-    float *att_concat;
-    float *moe_gate;
-    float *moe_up;
-    float *moe_router;
-    float *moe_out_acc;
-    int *moe_topk_idx;
-    float *moe_topk_w;
-} RunState;
-
-int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode);
+#include "model.h"
+#include "backend.h"
 
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
@@ -302,7 +149,7 @@ int glm_metal_init(const Runtime *rt, RunState *st) {
     }
 
     NSString *cwd = [[NSFileManager defaultManager] currentDirectoryPath];
-    NSString *libPath = [cwd stringByAppendingPathComponent:@"glm4.7-flash.metallib"];
+    NSString *libPath = [cwd stringByAppendingPathComponent:@"infer.metallib"];
     NSURL *libURL = [NSURL fileURLWithPath:libPath];
     NSError *err = nil;
     g_library = [g_device newLibraryWithURL:libURL error:&err];
@@ -398,13 +245,68 @@ int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos,
         return -1;
     }
 
+    glm_set_metal_matvec_mode(1);
     int status = glm_cpu_forward_token(rt, st, token, pos, debug_mode);
-    if (status != 0) return status;
+    glm_set_metal_matvec_mode(0);
+    return status;
+}
 
-    id<MTLCommandBuffer> cb = [g_queue commandBufferWithUnretainedReferences];
-    if (!cb) return 0;
+int glm_metal_matvec_rows(const int8_t *qmat, const float *smat, const float *x, float *y, int rows, int dim, int gs) {
+    if (!g_device || !g_queue) return -1;
+    if (!qmat || !smat || !x || !y) return -1;
+    if (rows <= 0 || dim <= 0 || gs <= 0 || (dim % gs) != 0) return -1;
+
+    const NSUInteger q_bytes = (NSUInteger)rows * (NSUInteger)dim * sizeof(int8_t);
+    const NSUInteger s_bytes = (NSUInteger)rows * (NSUInteger)(dim / gs) * sizeof(float);
+    const NSUInteger x_bytes = (NSUInteger)dim * sizeof(float);
+    const NSUInteger y_bytes = (NSUInteger)rows * sizeof(float);
+
+    id<MTLBuffer> q_buf = [g_device newBufferWithBytesNoCopy:(void *)qmat
+                                                       length:q_bytes
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    id<MTLBuffer> s_buf = [g_device newBufferWithBytesNoCopy:(void *)smat
+                                                       length:s_bytes
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    id<MTLBuffer> x_buf = [g_device newBufferWithBytesNoCopy:(void *)x
+                                                       length:x_bytes
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    id<MTLBuffer> y_buf = [g_device newBufferWithBytesNoCopy:(void *)y
+                                                       length:y_bytes
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+
+    if (!q_buf || !s_buf || !x_buf || !y_buf) return -1;
+
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return -1;
+    id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+    if (!encoder) return -1;
+
+    struct {
+        uint32_t rows;
+        uint32_t dim;
+        uint32_t gs;
+    } args = {(uint32_t)rows, (uint32_t)dim, (uint32_t)gs};
+
+    void *buffers[] = {
+        (__bridge void *)q_buf,
+        (__bridge void *)s_buf,
+        (__bridge void *)x_buf,
+        (__bridge void *)y_buf,
+    };
+    const unsigned int tgs = 128;
+    const unsigned int tgx = ((unsigned int)rows + tgs - 1u) / tgs;
+    dispatch(encoder, "matvec_q80_rows", tgx, tgs, &args, sizeof(args), buffers, 4);
+    [encoder endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    if (cb.error) {
+        fprintf(stderr, "[glm-metal] matvec command failed: %s\n", cb.error.localizedDescription.UTF8String);
+        return -1;
+    }
     return 0;
 }
 
