@@ -4,6 +4,10 @@ LDFLAGS ?= -lm
 UNAME_S := $(shell uname -s)
 PROJECT_ROOT := $(abspath .)
 MODEL_DIR ?= $(PROJECT_ROOT)/model
+BIN ?= glm4.7-flash
+METAL_SRC ?= infer.metal
+METAL_AIR ?= infer.air
+METAL_LIB ?= infer.metallib
 OPENMP_PREFIX ?= /opt/homebrew/opt/libomp
 ifndef OPENMP_MODE
 OPENMP_MODE := $(shell tmpc=/tmp/glm_openmp_probe_$$.c; tmpx=/tmp/glm_openmp_probe_$$.bin; \
@@ -75,10 +79,12 @@ BENCH_OMP_THREADS ?= 8
 BENCH_OMP_THREAD_LIST ?= 1 2 4 8
 BENCH_OMP_PROC_BIND ?= true
 BENCH_OMP_PLACES ?= cores
+BENCH_PREFILL_PROMPT ?= The quick brown fox jumps over the lazy dog. Repeat this sentence for prefill benchmarking.
+CAPTURE_PROMPT ?= 1+1=
 
 .PHONY: build
 build: $(APP_SOURCES)
-	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -o glm4.7-flash $(APP_SOURCES) $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
+	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -o $(BIN) $(APP_SOURCES) $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
 
 .PHONY: openmp-info
 openmp-info:
@@ -117,13 +123,13 @@ check-metal-toolchain:
 		(echo "missing Metal toolchain; run 'make metal-prereqs' and retry" && exit 1)
 
 .PHONY: metal-lib
-metal-lib: check-metal-toolchain infer.metal
-	xcrun -sdk macosx metal -std=metal3.0 -O0 -c infer.metal -o infer.air
-	xcrun -sdk macosx metallib infer.air -o infer.metallib
+metal-lib: check-metal-toolchain $(METAL_SRC)
+	xcrun -sdk macosx metal -std=metal3.0 -O0 -c $(METAL_SRC) -o $(METAL_AIR)
+	xcrun -sdk macosx metallib $(METAL_AIR) -o $(METAL_LIB)
 
 .PHONY: build-metal
 build-metal: metal-lib $(METAL_SOURCES)
-	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -DGLM_ENABLE_METAL=1 -x objective-c -fobjc-arc -o glm4.7-flash $(METAL_SOURCES) -framework Foundation -framework Metal $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
+	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -DGLM_ENABLE_METAL=1 -x objective-c -fobjc-arc -o $(BIN) $(METAL_SOURCES) -framework Foundation -framework Metal $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
 else
 .PHONY: metal-prereqs
 metal-prereqs:
@@ -372,6 +378,76 @@ bench-tps-omp: build
 	done; \
 	echo "[artifacts] /tmp/glm_tps_glm-cpu-omp-t*.txt /tmp/glm_tps_glm-cpu-omp-t*.time.txt"
 
+.PHONY: bench-prefill-cpu
+bench-prefill-cpu: build
+	@set -e; \
+	prompt="$(BENCH_PREFILL_PROMPT)"; \
+	out=/tmp/glm_prefill_cpu.txt; \
+	timef=/tmp/glm_prefill_cpu.time.txt; \
+	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n 0 -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	echo "prefill cpu done"; \
+	echo "[artifacts] $$out $$timef"
+
+.PHONY: bench-prefill-metal
+bench-prefill-metal: build-metal
+	@set -e; \
+	prompt="$(BENCH_PREFILL_PROMPT)"; \
+	out=/tmp/glm_prefill_metal.txt; \
+	timef=/tmp/glm_prefill_metal.time.txt; \
+	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 0 -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	echo "prefill metal done"; \
+	echo "[artifacts] $$out $$timef"
+
+.PHONY: bench-decode-cpu
+bench-decode-cpu: build
+	@set -e; \
+	tokens="$(BENCH_TOKENS)"; \
+	prompt="$(BENCH_PROMPT)"; \
+	out=/tmp/glm_decode_cpu.txt; \
+	timef=/tmp/glm_decode_cpu.time.txt; \
+	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	echo "decode cpu done"; \
+	echo "[artifacts] $$out $$timef"
+
+.PHONY: bench-decode-metal
+bench-decode-metal: build-metal
+	@set -e; \
+	tokens="$(BENCH_TOKENS)"; \
+	prompt="$(BENCH_PROMPT)"; \
+	out=/tmp/glm_decode_metal.txt; \
+	timef=/tmp/glm_decode_metal.time.txt; \
+	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	echo "decode metal done"; \
+	echo "[artifacts] $$out $$timef"
+
+.PHONY: bench-kernel-matvec
+bench-kernel-matvec: build-metal
+	@set -e; \
+	tokens="$(BENCH_TOKENS)"; \
+	prompt="$(BENCH_PROMPT)"; \
+	out=/tmp/glm_matvec_proxy_metal.txt; \
+	timef=/tmp/glm_matvec_proxy_metal.time.txt; \
+	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
+	echo "matvec proxy benchmark done (full decode path; use for relative kernel tuning only)"; \
+	echo "[artifacts] $$out $$timef"
+
+.PHONY: capture-metal
+capture-metal: build-metal
+	@set -e; \
+	out=/tmp/glm_metal_capture.txt; \
+	echo "Running with MTL_CAPTURE_ENABLED=1 ..."; \
+	MTL_CAPTURE_ENABLED=1 ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 8 -t 0 --seed 0 -i "$(CAPTURE_PROMPT)" > $$out; \
+	echo "Capture run complete."; \
+	echo "Open Xcode GPU capture tools and inspect this run context."; \
+	echo "[artifact] $$out"
+
+.PHONY: bench-summary
+bench-summary:
+	BENCH_TOKENS=$(BENCH_TOKENS) python3 scripts/bench_summary.py
+	@echo "[artifacts] /tmp/glm_bench_summary.json /tmp/glm_bench_summary.csv"
+
 .PHONY: clean
 clean:
-	rm -f glm4.7-flash infer.air infer.metallib glm4.7-flash.air glm4.7-flash.metallib /tmp/glm_tps_glm-*.txt /tmp/glm_tps_glm-*.time.txt
+	rm -f $(BIN) $(METAL_AIR) $(METAL_LIB)
