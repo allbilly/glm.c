@@ -81,6 +81,7 @@ BENCH_OMP_PROC_BIND ?= true
 BENCH_OMP_PLACES ?= cores
 BENCH_PREFILL_PROMPT ?= The quick brown fox jumps over the lazy dog. Repeat this sentence for prefill benchmarking.
 CAPTURE_PROMPT ?= 1+1=
+METAL_NATIVE ?= 0
 
 .PHONY: build
 build: $(APP_SOURCES)
@@ -325,6 +326,30 @@ bench-tps: build-metal
 	printf "%-22s %8s\n" "llama.cpp metal" "$$llama_metal_tps"; \
 	echo "[artifacts] $$glm_cpu_out $$glm_cpu_time $$glm_metal_out $$glm_metal_time $$llama_cpu_json $$llama_metal_json"
 
+.PHONY: bench-metal-phases
+bench-metal-phases: build-metal
+	@set -e; \
+	tokens="$(BENCH_TOKENS)"; \
+	prompt="$(BENCH_PROMPT)"; \
+	cpu_time=/tmp/glm_phase_cpu.time.txt; \
+	metal_time=/tmp/glm_phase_metal.time.txt; \
+	metal_native_time=/tmp/glm_phase_metal_native.time.txt; \
+	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > /tmp/glm_phase_cpu.txt 2> $$cpu_time; \
+	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > /tmp/glm_phase_metal.txt 2> $$metal_time; \
+	if [ "$(METAL_NATIVE)" = "1" ]; then \
+		GLM_METAL_NATIVE=1 /usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > /tmp/glm_phase_metal_native.txt 2> $$metal_native_time; \
+	fi; \
+	cpu_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$cpu_time); \
+	metal_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$metal_time); \
+	echo "phase bench cpu tok/s=$$cpu_tps"; \
+	echo "phase bench metal tok/s=$$metal_tps"; \
+	if [ "$(METAL_NATIVE)" = "1" ]; then \
+		metal_native_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$metal_native_time); \
+		echo "phase bench metal(native) tok/s=$$metal_native_tps"; \
+	fi; \
+	echo "[artifacts] /tmp/glm_phase_cpu.txt $$cpu_time /tmp/glm_phase_metal.txt $$metal_time /tmp/glm_phase_metal_native.txt $$metal_native_time"
+
 .PHONY: bench-tps-cpu
 bench-tps-cpu: build
 	@set -e; \
@@ -451,3 +476,65 @@ bench-summary:
 .PHONY: clean
 clean:
 	rm -f $(BIN) $(METAL_AIR) $(METAL_LIB)
+
+# Kernel microbenchmark targets
+BENCH_KERNEL_ITERS ?= 128
+BENCH_KERNEL_WARMUP ?= 16
+
+.PHONY: bench-micro-matvec
+bench-micro-matvec: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel matvec_q80_rows \
+		--bench-iters $(BENCH_KERNEL_ITERS) --bench-warmup $(BENCH_KERNEL_WARMUP)
+
+.PHONY: bench-micro-matvec-simdgroup
+bench-micro-matvec-simdgroup: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel matvec_q80_rows_simdgroup \
+		--bench-iters $(BENCH_KERNEL_ITERS) --bench-warmup $(BENCH_KERNEL_WARMUP)
+
+.PHONY: bench-kernel-rmsnorm
+bench-kernel-rmsnorm: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel rmsnorm_f32 \
+		--bench-iters $(BENCH_KERNEL_ITERS) --bench-warmup $(BENCH_KERNEL_WARMUP)
+
+.PHONY: bench-kernel-rope
+bench-kernel-rope: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel rope_inplace \
+		--bench-iters $(BENCH_KERNEL_ITERS) --bench-warmup $(BENCH_KERNEL_WARMUP)
+
+.PHONY: bench-kernel-attention
+bench-kernel-attention: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel attention_scores_context \
+		--bench-iters 64 --bench-warmup 8
+
+.PHONY: bench-micro-all
+bench-micro-all: bench-micro-matvec bench-micro-matvec-simdgroup bench-kernel-rmsnorm bench-kernel-rope bench-kernel-attention
+
+# Compare matvec variants
+.PHONY: bench-micro-matvec-compare
+bench-micro-matvec-compare: build-metal
+	@echo "=== Baseline matvec ==="
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel matvec_q80_rows \
+		--bench-iters $(BENCH_KERNEL_ITERS) --bench-warmup $(BENCH_KERNEL_WARMUP)
+	@echo ""
+	@echo "=== SIMD-group matvec ==="
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal --bench-kernel matvec_q80_rows_simdgroup \
+		--bench-iters $(BENCH_KERNEL_ITERS) --bench-warmup $(BENCH_KERNEL_WARMUP)
+
+# Per-token latency benchmark targets
+.PHONY: bench-latency-full
+bench-latency-full: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) \
+		--bench-mode full -i "$(BENCH_PROMPT)" --bench-report /tmp/glm_bench_full.json
+	@echo "[artifact] /tmp/glm_bench_full.json"
+
+.PHONY: bench-latency-decode
+bench-latency-decode: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) \
+		--bench-mode decode -i "$(BENCH_PROMPT)" --bench-report /tmp/glm_bench_decode.json
+	@echo "[artifact] /tmp/glm_bench_decode.json"
+
+.PHONY: bench-latency-prefill
+bench-latency-prefill: build-metal
+	@./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 0 \
+		--bench-mode prefill -i "$(BENCH_PREFILL_PROMPT)" --bench-report /tmp/glm_bench_prefill.json
+	@echo "[artifact] /tmp/glm_bench_prefill.json"

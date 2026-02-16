@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "backend.h"
 
@@ -789,6 +790,9 @@ static void dequant_row(const int8_t *qrow, const float *srow, float *out, int d
 }
 
 static void matvec_rows(const int8_t *qmat, const float *smat, const float *x, float *y, int rows, int dim, int gs) {
+    if (glm_backend_try_metal_matvec(qmat, smat, x, y, rows, dim, gs) == 0) {
+        return;
+    }
     matvec_q80_rows(qmat, smat, x, y, rows, dim, gs);
 }
 
@@ -863,6 +867,45 @@ static void runstate_build(RunState *s, const Runtime *rt, int cache_cap) {
         (rt->has_moe_shared && cfg->moe_ffn_dim > 0 &&
          (!s->moe_gate || !s->moe_up || !s->moe_router || !s->moe_out_acc || !s->moe_topk_idx || !s->moe_topk_w))) {
         die("out of memory");
+    }
+}
+
+static void runstate_copy_from(const Runtime *rt, const RunState *src, RunState *dst) {
+    if (!rt || !src || !dst) return;
+    const RuntimeConfig *cfg = &rt->cfg;
+
+    memcpy(dst->x, src->x, (size_t)cfg->dim * sizeof(float));
+    memcpy(dst->xn, src->xn, (size_t)cfg->dim * sizeof(float));
+    memcpy(dst->xb, src->xb, (size_t)cfg->dim * sizeof(float));
+    memcpy(dst->ff_gate, src->ff_gate, (size_t)cfg->hidden_dim * sizeof(float));
+    memcpy(dst->ff_up, src->ff_up, (size_t)cfg->hidden_dim * sizeof(float));
+    memcpy(dst->logits, src->logits, (size_t)cfg->vocab_size * sizeof(float));
+
+    if (src->n_attn_layers > 0) {
+        memcpy(dst->k_cache_comp,
+               src->k_cache_comp,
+               (size_t)src->n_attn_layers * (size_t)src->cache_cap * (size_t)cfg->kv_lora_rank * sizeof(float));
+        memcpy(dst->k_cache_pe,
+               src->k_cache_pe,
+               (size_t)src->n_attn_layers * (size_t)src->cache_cap * (size_t)cfg->rope_dim * sizeof(float));
+        memcpy(dst->q_a, src->q_a, (size_t)cfg->q_lora_rank * sizeof(float));
+        memcpy(dst->q_full, src->q_full, (size_t)cfg->n_heads * (size_t)cfg->l0_head_k_dim * sizeof(float));
+        memcpy(dst->kv_a, src->kv_a, (size_t)(cfg->kv_lora_rank + cfg->rope_dim) * sizeof(float));
+        memcpy(dst->q_nope, src->q_nope, (size_t)cfg->l0_qk_nope_dim * sizeof(float));
+        memcpy(dst->q_pe, src->q_pe, (size_t)cfg->rope_dim * sizeof(float));
+        memcpy(dst->q_abs, src->q_abs, (size_t)cfg->kv_lora_rank * sizeof(float));
+        memcpy(dst->att_scores, src->att_scores, (size_t)src->cache_cap * sizeof(float));
+        memcpy(dst->att_ctx, src->att_ctx, (size_t)cfg->kv_lora_rank * sizeof(float));
+        memcpy(dst->att_concat, src->att_concat, (size_t)cfg->n_heads * (size_t)cfg->l0_v_head_dim * sizeof(float));
+    }
+
+    if (rt->has_moe_shared && cfg->moe_ffn_dim > 0) {
+        memcpy(dst->moe_gate, src->moe_gate, (size_t)cfg->moe_ffn_dim * sizeof(float));
+        memcpy(dst->moe_up, src->moe_up, (size_t)cfg->moe_ffn_dim * sizeof(float));
+        memcpy(dst->moe_router, src->moe_router, (size_t)cfg->n_routed_experts * sizeof(float));
+        memcpy(dst->moe_out_acc, src->moe_out_acc, (size_t)cfg->dim * sizeof(float));
+        memcpy(dst->moe_topk_idx, src->moe_topk_idx, (size_t)cfg->n_experts_used * sizeof(int));
+        memcpy(dst->moe_topk_w, src->moe_topk_w, (size_t)cfg->n_experts_used * sizeof(float));
     }
 }
 
@@ -1360,7 +1403,229 @@ static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids,
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--backend cpu|metal] [--debug] [--self-test-tokenizer]\n", prog);
+    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--backend cpu|metal] [--debug] [--self-test-tokenizer] [--bench-mode full|prefill|decode] [--bench-report PATH] [--bench-kernel NAME] [--bench-iters N] [--bench-warmup N]\n", prog);
+}
+
+typedef enum {
+    BENCH_MODE_OFF = 0,
+    BENCH_MODE_FULL,
+    BENCH_MODE_PREFILL,
+    BENCH_MODE_DECODE,
+} BenchMode;
+
+typedef struct {
+    int n;
+    double mean_ms;
+    double p50_ms;
+    double p95_ms;
+    double tok_s;
+    double active_bytes;
+    double bw_gbps;
+} BenchPhaseReport;
+
+static double monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+static int latency_push(double **arr, int *n, int *cap, double value) {
+    if (*n >= *cap) {
+        int next = (*cap == 0) ? 128 : (*cap * 2);
+        double *tmp = (double *)realloc(*arr, (size_t)next * sizeof(double));
+        if (!tmp) return 0;
+        *arr = tmp;
+        *cap = next;
+    }
+    (*arr)[(*n)++] = value;
+    return 1;
+}
+
+static int cmp_double_asc(const void *a, const void *b) {
+    const double da = *(const double *)a;
+    const double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static double percentile_sorted(const double *sorted, int n, double pct) {
+    if (!sorted || n <= 0) return 0.0;
+    if (pct <= 0.0) return sorted[0];
+    if (pct >= 100.0) return sorted[n - 1];
+    double rank = (pct / 100.0) * (double)(n - 1);
+    int lo = (int)rank;
+    int hi = lo + 1;
+    if (hi >= n) return sorted[n - 1];
+    double frac = rank - (double)lo;
+    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+}
+
+static double q80_bytes(size_t rows, size_t cols, size_t gs) {
+    if (rows == 0 || cols == 0 || gs == 0) return 0.0;
+    size_t groups = cols / gs;
+    double q = (double)rows * (double)cols * (double)sizeof(int8_t);
+    double s = (double)rows * (double)groups * (double)sizeof(float);
+    return q + s;
+}
+
+static double estimate_model_active_bytes(const Runtime *rt) {
+    if (!rt) return 0.0;
+    const RuntimeConfig *cfg = &rt->cfg;
+    size_t dim = (size_t)cfg->dim;
+    size_t hidden = (size_t)cfg->hidden_dim;
+    size_t vocab = (size_t)cfg->vocab_size;
+    size_t gs = (size_t)cfg->group_size;
+    if (gs == 0 || dim == 0) return 0.0;
+
+    double bytes = 0.0;
+    bytes += (double)dim * sizeof(int8_t) + (double)(dim / gs) * sizeof(float);
+    bytes += (double)dim * sizeof(float);
+    bytes += q80_bytes(vocab, dim, gs);
+
+    if (rt->has_l0_ffn) {
+        bytes += (double)dim * sizeof(float);
+        bytes += q80_bytes(hidden, dim, gs);
+        bytes += q80_bytes(hidden, dim, gs);
+        bytes += q80_bytes(dim, hidden, gs);
+    }
+
+    int n_attn_layers = rt->has_all_attn ? cfg->n_layers : (rt->has_l0_attn ? 1 : 0);
+    if (n_attn_layers > 0 && cfg->l0_qk_nope_dim > 0 && cfg->l0_head_k_dim > 0 && cfg->l0_v_head_dim > 0) {
+        size_t q_lora = (size_t)cfg->q_lora_rank;
+        size_t kv_lora = (size_t)cfg->kv_lora_rank;
+        size_t rope = (size_t)cfg->rope_dim;
+        size_t n_heads = (size_t)cfg->n_heads;
+        size_t qk_nope = (size_t)cfg->l0_qk_nope_dim;
+        size_t head_k = (size_t)cfg->l0_head_k_dim;
+        size_t v_head = (size_t)cfg->l0_v_head_dim;
+        size_t attn_out = n_heads * v_head;
+
+        double per_layer = 0.0;
+        per_layer += (double)dim * sizeof(float);
+        per_layer += (double)q_lora * sizeof(float);
+        per_layer += (double)kv_lora * sizeof(float);
+        per_layer += q80_bytes(q_lora, dim, gs);
+        per_layer += q80_bytes(n_heads * head_k, q_lora, gs);
+        per_layer += q80_bytes(kv_lora + rope, dim, gs);
+        per_layer += q80_bytes(n_heads * kv_lora, qk_nope, gs);
+        per_layer += q80_bytes(n_heads * v_head, kv_lora, gs);
+        per_layer += q80_bytes(dim, attn_out, gs);
+
+        bytes += per_layer * (double)n_attn_layers;
+    }
+
+    if (rt->has_moe_shared && cfg->moe_ffn_dim > 0 && cfg->n_layers > 1) {
+        size_t moe_dim = (size_t)cfg->moe_ffn_dim;
+        size_t n_routed = (size_t)cfg->n_routed_experts;
+        int n_moe_layers = cfg->n_layers - 1;
+
+        double shared = 0.0;
+        shared += (double)dim * sizeof(float);
+        shared += (double)n_routed * (double)dim * sizeof(float);
+        shared += (double)n_routed * sizeof(float);
+        shared += q80_bytes(moe_dim, dim, gs);
+        shared += q80_bytes(moe_dim, dim, gs);
+        shared += q80_bytes(dim, moe_dim, gs);
+        bytes += shared * (double)n_moe_layers;
+
+        if (rt->has_moe_routed && cfg->n_experts_used > 0) {
+            double per_expert = 0.0;
+            per_expert += q80_bytes(moe_dim, dim, gs);
+            per_expert += q80_bytes(moe_dim, dim, gs);
+            per_expert += q80_bytes(dim, moe_dim, gs);
+            bytes += per_expert * (double)cfg->n_experts_used * (double)n_moe_layers;
+        }
+    }
+
+    return bytes;
+}
+
+static double estimate_cache_active_bytes(const Runtime *rt, const RunState *st, int pos) {
+    if (!rt || !st || pos < 0 || st->n_attn_layers <= 0) return 0.0;
+    double kv = (double)rt->cfg.kv_lora_rank;
+    double rope = (double)rt->cfg.rope_dim;
+    double heads = (double)rt->cfg.n_heads;
+    double layers = (double)st->n_attn_layers;
+    double t = (double)(pos + 1);
+    double bytes_f = (double)sizeof(float);
+
+    double read_scores = heads * t * (kv + rope) * bytes_f;
+    double read_ctx = heads * t * kv * bytes_f;
+    double write_cache = (kv + rope) * bytes_f;
+    return layers * (read_scores + read_ctx + write_cache);
+}
+
+static BenchPhaseReport build_phase_report(const double *samples, int n, double model_bytes, double cache_sum_bytes) {
+    BenchPhaseReport r = {0};
+    if (!samples || n <= 0) return r;
+
+    double *sorted = (double *)malloc((size_t)n * sizeof(double));
+    if (!sorted) return r;
+    double total = 0.0;
+    for (int i = 0; i < n; i++) {
+        sorted[i] = samples[i];
+        total += samples[i];
+    }
+    qsort(sorted, (size_t)n, sizeof(double), cmp_double_asc);
+
+    r.n = n;
+    r.mean_ms = total / (double)n;
+    r.p50_ms = percentile_sorted(sorted, n, 50.0);
+    r.p95_ms = percentile_sorted(sorted, n, 95.0);
+    r.tok_s = (r.mean_ms > 0.0) ? (1000.0 / r.mean_ms) : 0.0;
+    r.active_bytes = model_bytes + (cache_sum_bytes / (double)n);
+    r.bw_gbps = (r.mean_ms > 0.0) ? ((r.active_bytes / (r.mean_ms / 1000.0)) / 1e9) : 0.0;
+    free(sorted);
+    return r;
+}
+
+static void print_phase_report(const char *phase, BenchPhaseReport r) {
+    if (!phase || r.n <= 0) return;
+    fprintf(stderr,
+            "[glm-bench] phase=%s tokens=%d tok_s=%.3f mean_ms=%.3f p50_ms=%.3f p95_ms=%.3f active_bytes=%.0f est_bw_gbps=%.3f\n",
+            phase, r.n, r.tok_s, r.mean_ms, r.p50_ms, r.p95_ms, r.active_bytes, r.bw_gbps);
+}
+
+static void write_bench_report_json(const char *path,
+                                    const char *backend,
+                                    BenchMode mode,
+                                    int prompt_tokens,
+                                    int generated_tokens,
+                                    BenchPhaseReport prefill,
+                                    BenchPhaseReport decode) {
+    if (!path || path[0] == '\0') return;
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "[glm-bench] warning: failed to open report path: %s\n", path);
+        return;
+    }
+    const char *mode_s = mode == BENCH_MODE_PREFILL ? "prefill" : (mode == BENCH_MODE_DECODE ? "decode" : "full");
+    fprintf(f, "{\n");
+    fprintf(f, "  \"backend\": \"%s\",\n", backend ? backend : "cpu");
+    fprintf(f, "  \"mode\": \"%s\",\n", mode_s);
+    fprintf(f, "  \"prompt_tokens\": %d,\n", prompt_tokens);
+    fprintf(f, "  \"generated_tokens\": %d,\n", generated_tokens);
+    fprintf(f, "  \"prefill\": {\n");
+    fprintf(f, "    \"tokens\": %d,\n", prefill.n);
+    fprintf(f, "    \"tok_s\": %.6f,\n", prefill.tok_s);
+    fprintf(f, "    \"mean_ms\": %.6f,\n", prefill.mean_ms);
+    fprintf(f, "    \"p50_ms\": %.6f,\n", prefill.p50_ms);
+    fprintf(f, "    \"p95_ms\": %.6f,\n", prefill.p95_ms);
+    fprintf(f, "    \"active_bytes\": %.0f,\n", prefill.active_bytes);
+    fprintf(f, "    \"est_bw_gbps\": %.6f\n", prefill.bw_gbps);
+    fprintf(f, "  },\n");
+    fprintf(f, "  \"decode\": {\n");
+    fprintf(f, "    \"tokens\": %d,\n", decode.n);
+    fprintf(f, "    \"tok_s\": %.6f,\n", decode.tok_s);
+    fprintf(f, "    \"mean_ms\": %.6f,\n", decode.mean_ms);
+    fprintf(f, "    \"p50_ms\": %.6f,\n", decode.p50_ms);
+    fprintf(f, "    \"p95_ms\": %.6f,\n", decode.p95_ms);
+    fprintf(f, "    \"active_bytes\": %.0f,\n", decode.active_bytes);
+    fprintf(f, "    \"est_bw_gbps\": %.6f\n", decode.bw_gbps);
+    fprintf(f, "  }\n");
+    fprintf(f, "}\n");
+    fclose(f);
 }
 
 static char *read_text_file_alloc(const char *path) {
@@ -1499,9 +1764,28 @@ static void print_topk_debug(const float *logits, const Tokenizer *tok, int voca
     free(val);
 }
 
-int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode) {
+static int glm_cpu_forward_token_impl(const Runtime *rt,
+                                      RunState *st,
+                                      int token,
+                                      int pos,
+                                      int debug_mode,
+                                      float *attn_layer_out,
+                                      int attn_layer_stride,
+                                      int max_attn_layers,
+                                      int *written_attn_layers,
+                                      float *layer_out,
+                                      int layer_stride,
+                                      int max_layers,
+                                      int *written_layers) {
     if (!rt || !st) return -1;
     if (token < 0 || token >= rt->cfg.vocab_size) token = 0;
+    if (written_layers) *written_layers = 0;
+    if (written_attn_layers) *written_attn_layers = 0;
+
+    int attn_checkpoints_enabled = (attn_layer_out != NULL && attn_layer_stride >= rt->cfg.dim && max_attn_layers > 0);
+    int checkpoints_enabled = (layer_out != NULL && layer_stride >= rt->cfg.dim && max_layers > 0);
+    int attn_layers_written = 0;
+    int layers_written = 0;
 
     LayerAttnWeights l0_attn_weights = {
         .attn_norm = rt->l0_attn_norm,
@@ -1538,6 +1822,12 @@ int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, i
                 sum_before_attn = sum_f32(st->x, rt->cfg.dim);
             }
             apply_mla_attention_layer(rt, &rt->attn_layers[l], st, gs, pos, l, debug_mode);
+            if (attn_checkpoints_enabled && l < max_attn_layers) {
+                memcpy(attn_layer_out + (size_t)l * (size_t)attn_layer_stride,
+                       st->x,
+                       (size_t)rt->cfg.dim * sizeof(float));
+                attn_layers_written = l + 1;
+            }
             float sum_before_ffn = 0.0f;
             if (debug_mode && pos == 0) {
                 char name[32];
@@ -1553,6 +1843,12 @@ int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, i
             }
             if (l == 0) apply_l0_dense_ffn(rt, st, gs, debug_mode);
             else apply_moe_shared_ffn_layer(rt, st, gs, l, debug_mode, pos);
+
+            if (checkpoints_enabled && l < max_layers) {
+                memcpy(layer_out + (size_t)l * (size_t)layer_stride, st->x, (size_t)rt->cfg.dim * sizeof(float));
+                layers_written = l + 1;
+            }
+
             if (debug_mode && pos == 0) {
                 char name[32];
                 snprintf(name, sizeof(name), "l_out-%d", l);
@@ -1565,13 +1861,25 @@ int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, i
         assert_finite_slice("attn_stack_out", st->x, rt->cfg.dim, debug_mode);
     } else if (rt->has_l0_attn) {
         apply_mla_attention_layer(rt, &l0_attn_weights, st, gs, pos, 0, debug_mode);
+        if (attn_checkpoints_enabled && max_attn_layers > 0) {
+            memcpy(attn_layer_out, st->x, (size_t)rt->cfg.dim * sizeof(float));
+            attn_layers_written = 1;
+        }
         assert_finite_slice("l0_attn_out", st->x, rt->cfg.dim, debug_mode);
         apply_l0_dense_ffn(rt, st, gs, debug_mode);
+        if (checkpoints_enabled && max_layers > 0) {
+            memcpy(layer_out, st->x, (size_t)rt->cfg.dim * sizeof(float));
+            layers_written = 1;
+        }
         if (debug_mode && pos == 0) {
             debug_print_tensor_sum("l_out-0", st->x, rt->cfg.dim);
         }
     } else {
         apply_l0_dense_ffn(rt, st, gs, debug_mode);
+        if (checkpoints_enabled && max_layers > 0) {
+            memcpy(layer_out, st->x, (size_t)rt->cfg.dim * sizeof(float));
+            layers_written = 1;
+        }
         if (debug_mode && pos == 0) {
             debug_print_tensor_sum("l_out-0", st->x, rt->cfg.dim);
         }
@@ -1587,7 +1895,91 @@ int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, i
     if (debug_mode && pos == 0) {
         debug_print_tensor_sum("result_output", st->logits, rt->cfg.vocab_size);
     }
+    if (written_layers) *written_layers = layers_written;
+    if (written_attn_layers) *written_attn_layers = attn_layers_written;
     return 0;
+}
+
+int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode) {
+    return glm_cpu_forward_token_impl(rt, st, token, pos, debug_mode, NULL, 0, 0, NULL, NULL, 0, 0, NULL);
+}
+
+int glm_cpu_forward_token_checkpoints(const Runtime *rt,
+                                      const RunState *src,
+                                      int token,
+                                      int pos,
+                                      int debug_mode,
+                                      float *layer_out,
+                                      int layer_stride,
+                                      int max_layers,
+                                      int *written_layers) {
+    if (!rt || !src || !layer_out || layer_stride < rt->cfg.dim || max_layers <= 0) return -1;
+    if (src->cache_cap <= 0) return -1;
+
+    RunState tmp;
+    runstate_build(&tmp, rt, src->cache_cap);
+    runstate_copy_from(rt, src, &tmp);
+
+    int local_written = 0;
+    int rc = glm_cpu_forward_token_impl(rt,
+                                        &tmp,
+                                        token,
+                                        pos,
+                                        debug_mode,
+                                        NULL,
+                                        0,
+                                        0,
+                                        NULL,
+                                        layer_out,
+                                        layer_stride,
+                                        max_layers,
+                                        &local_written);
+    if (written_layers) *written_layers = local_written;
+    runstate_free(&tmp);
+    return rc;
+}
+
+int glm_cpu_forward_token_dual_checkpoints(const Runtime *rt,
+                                           const RunState *src,
+                                           int token,
+                                           int pos,
+                                           int debug_mode,
+                                           float *attn_layer_out,
+                                           int attn_layer_stride,
+                                           int max_attn_layers,
+                                           int *written_attn_layers,
+                                           float *layer_out,
+                                           int layer_stride,
+                                           int max_layers,
+                                           int *written_layers) {
+    if (!rt || !src) return -1;
+    if (src->cache_cap <= 0) return -1;
+    if (attn_layer_out && (attn_layer_stride < rt->cfg.dim || max_attn_layers <= 0)) return -1;
+    if (layer_out && (layer_stride < rt->cfg.dim || max_layers <= 0)) return -1;
+
+    RunState tmp;
+    runstate_build(&tmp, rt, src->cache_cap);
+    runstate_copy_from(rt, src, &tmp);
+
+    int local_written_attn = 0;
+    int local_written = 0;
+    int rc = glm_cpu_forward_token_impl(rt,
+                                        &tmp,
+                                        token,
+                                        pos,
+                                        debug_mode,
+                                        attn_layer_out,
+                                        attn_layer_stride,
+                                        max_attn_layers,
+                                        &local_written_attn,
+                                        layer_out,
+                                        layer_stride,
+                                        max_layers,
+                                        &local_written);
+    if (written_attn_layers) *written_attn_layers = local_written_attn;
+    if (written_layers) *written_layers = local_written;
+    runstate_free(&tmp);
+    return rc;
 }
 
 int glm_app_main(int argc, char **argv) {
@@ -1608,6 +2000,11 @@ int glm_app_main(int argc, char **argv) {
     int self_test_tokenizer = 0;
     int backend_set = 0;
     BackendType backend = BACKEND_CPU;
+    BenchMode bench_mode = BENCH_MODE_OFF;
+    const char *bench_report_path = NULL;
+    const char *bench_kernel = NULL;
+    int bench_iters = 128;
+    int bench_warmup = 16;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
@@ -1619,6 +2016,28 @@ int glm_app_main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
         else if (strcmp(argv[i], "--debug") == 0) debug_mode = 1;
         else if (strcmp(argv[i], "--self-test-tokenizer") == 0) self_test_tokenizer = 1;
+        else if (strcmp(argv[i], "--bench-mode") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "full") == 0) bench_mode = BENCH_MODE_FULL;
+            else if (strcmp(v, "prefill") == 0) bench_mode = BENCH_MODE_PREFILL;
+            else if (strcmp(v, "decode") == 0) bench_mode = BENCH_MODE_DECODE;
+            else {
+                fprintf(stderr, "Error: unknown bench mode '%s' (expected full|prefill|decode)\n", v);
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--bench-report") == 0 && i + 1 < argc) {
+            bench_report_path = argv[++i];
+        }
+        else if (strcmp(argv[i], "--bench-kernel") == 0 && i + 1 < argc) {
+            bench_kernel = argv[++i];
+        }
+        else if (strcmp(argv[i], "--bench-iters") == 0 && i + 1 < argc) {
+            bench_iters = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--bench-warmup") == 0 && i + 1 < argc) {
+            bench_warmup = atoi(argv[++i]);
+        }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
             if (strcmp(v, "cpu") == 0) {
@@ -1645,6 +2064,8 @@ int glm_app_main(int argc, char **argv) {
         fprintf(stderr, "Error: temperature must be >= 0.\n");
         return 1;
     }
+    if (bench_iters < 1) bench_iters = 1;
+    if (bench_warmup < 0) bench_warmup = 0;
     if (context_limit < 0) {
         fprintf(stderr, "Error: context limit must be >= 0.\n");
         return 1;
@@ -1661,25 +2082,27 @@ int glm_app_main(int argc, char **argv) {
     Tokenizer tok;
     load_tokenizer(checkpoint, &tok, rt.cfg.vocab_size);
 
-    printf("[glm4.7-flash] loaded checkpoint\n");
-    printf("  dim=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d\n",
-           rt.cfg.dim, rt.cfg.n_layers, rt.cfg.n_heads, rt.cfg.n_kv_heads, rt.cfg.vocab_size, rt.cfg.seq_len);
-    printf("  mode=%s version=%u\n", mode, rt.cfg.version);
-    const char *attn_tag = rt.has_all_attn ? "+mla_attn_all" : (rt.has_l0_attn ? "+l0_mla_attn" : "");
-    printf("  forward=embed%s%s%s%s+final_norm+lm_head\n",
-           attn_tag,
-           rt.has_l0_ffn ? "+l0_dense_ffn" : "",
-           rt.has_moe_shared ? "+moe_shared_ffn" : "",
-           rt.has_moe_routed ? "+moe_routed" : "");
-    printf("  blocks: l0_attn=%s all_attn=%s l0_ffn=%s moe_shared=%s moe_routed=%s native_coverage=%s\n",
-           rt.has_l0_attn ? "on" : "off",
-           rt.has_all_attn ? "on" : "off",
-           rt.has_l0_ffn ? "on" : "off",
-           rt.has_moe_shared ? "on" : "off",
-           rt.has_moe_routed ? "on" : "off",
-           (rt.cfg.l0_flags & FLAG_NATIVE_COVERAGE_FULL) ? "full" : "partial");
-    printf("  attn_layers_active=%d\n", rt.has_all_attn ? rt.cfg.n_layers : (rt.has_l0_attn ? 1 : 0));
-    printf("  backend=%s\n", backend == BACKEND_METAL ? "metal" : "cpu");
+    if (bench_mode == BENCH_MODE_OFF) {
+        printf("[glm4.7-flash] loaded checkpoint\n");
+        printf("  dim=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d\n",
+               rt.cfg.dim, rt.cfg.n_layers, rt.cfg.n_heads, rt.cfg.n_kv_heads, rt.cfg.vocab_size, rt.cfg.seq_len);
+        printf("  mode=%s version=%u\n", mode, rt.cfg.version);
+        const char *attn_tag = rt.has_all_attn ? "+mla_attn_all" : (rt.has_l0_attn ? "+l0_mla_attn" : "");
+        printf("  forward=embed%s%s%s%s+final_norm+lm_head\n",
+               attn_tag,
+               rt.has_l0_ffn ? "+l0_dense_ffn" : "",
+               rt.has_moe_shared ? "+moe_shared_ffn" : "",
+               rt.has_moe_routed ? "+moe_routed" : "");
+        printf("  blocks: l0_attn=%s all_attn=%s l0_ffn=%s moe_shared=%s moe_routed=%s native_coverage=%s\n",
+               rt.has_l0_attn ? "on" : "off",
+               rt.has_all_attn ? "on" : "off",
+               rt.has_l0_ffn ? "on" : "off",
+               rt.has_moe_shared ? "on" : "off",
+               rt.has_moe_routed ? "on" : "off",
+               (rt.cfg.l0_flags & FLAG_NATIVE_COVERAGE_FULL) ? "full" : "partial");
+        printf("  attn_layers_active=%d\n", rt.has_all_attn ? rt.cfg.n_layers : (rt.has_l0_attn ? 1 : 0));
+        printf("  backend=%s\n", backend == BACKEND_METAL ? "metal" : "cpu");
+    }
 
     if (self_test_tokenizer) {
         int pass = run_tokenizer_self_test(&tok, rt.cfg.bos_id);
@@ -1729,7 +2152,7 @@ int glm_app_main(int argc, char **argv) {
         }
     }
 
-    if (strlen(prompt) > 0) {
+    if (bench_mode == BENCH_MODE_OFF && strlen(prompt) > 0) {
         printf("%s", prompt);
         if (prompt[strlen(prompt) - 1] != '\n') putchar('\n');
     }
@@ -1762,18 +2185,79 @@ int glm_app_main(int argc, char **argv) {
 
     RunState st;
     runstate_build(&st, &rt, cache_cap);
+    if (bench_kernel != NULL) {
+        setenv("GLM_METAL_FORCE_INIT", "1", 0);
+    }
     int use_metal = glm_backend_init(backend, &rt, &st);
+
+    if (bench_kernel != NULL) {
+        if (backend != BACKEND_METAL) {
+            fprintf(stderr, "[glm-kbench] --bench-kernel requires --backend metal\n");
+            glm_backend_free(use_metal);
+            free(prompt_ids);
+            free(prompt_file_buf);
+            runstate_free(&st);
+            tokenizer_free(&tok);
+            runtime_close(&rt);
+            return 1;
+        }
+        if (!use_metal) {
+            fprintf(stderr, "[glm-kbench] metal backend unavailable\n");
+            glm_backend_free(use_metal);
+            free(prompt_ids);
+            free(prompt_file_buf);
+            runstate_free(&st);
+            tokenizer_free(&tok);
+            runtime_close(&rt);
+            return 1;
+        }
+        int kst = glm_backend_metal_microbench(use_metal, &rt, bench_kernel, bench_iters, bench_warmup);
+        glm_backend_free(use_metal);
+        free(prompt_ids);
+        free(prompt_file_buf);
+        runstate_free(&st);
+        tokenizer_free(&tok);
+        runtime_close(&rt);
+        return kst == 0 ? 0 : 1;
+    }
 
     int token = prompt_ids[0];
     if (token < 0 || token >= rt.cfg.vocab_size) token = 0;
     int prompt_index = 1;
     int generated = 0;
+    int forward_failed = 0;
+
+    double *prefill_lat_ms = NULL;
+    double *decode_lat_ms = NULL;
+    int prefill_n = 0, decode_n = 0;
+    int prefill_cap = 0, decode_cap = 0;
+    double prefill_cache_sum = 0.0;
+    double decode_cache_sum = 0.0;
+    double model_active_bytes = estimate_model_active_bytes(&rt);
+
     for (int pos = 0; pos < cache_cap; pos++) {
+        if (bench_mode == BENCH_MODE_PREFILL && pos >= n_prompt) break;
+
+        int in_prefill_phase = pos < n_prompt;
+        double t0_ms = monotonic_ms();
         int fwd_status = glm_backend_forward_token(use_metal, &rt, &st, token, pos, debug_mode);
+        double elapsed_ms = monotonic_ms() - t0_ms;
         if (fwd_status != 0) {
             fprintf(stderr, "[error] forward failed at pos=%d\n", pos);
+            forward_failed = 1;
             break;
         }
+
+        if (bench_mode != BENCH_MODE_OFF) {
+            if (in_prefill_phase) {
+                if (!latency_push(&prefill_lat_ms, &prefill_n, &prefill_cap, elapsed_ms)) die("out of memory");
+                prefill_cache_sum += estimate_cache_active_bytes(&rt, &st, pos);
+            } else {
+                if (!latency_push(&decode_lat_ms, &decode_n, &decode_cap, elapsed_ms)) die("out of memory");
+                decode_cache_sum += estimate_cache_active_bytes(&rt, &st, pos);
+            }
+        }
+
         if (debug_mode && prompt_index >= n_prompt && generated == 0) {
             print_topk_debug(st.logits, &tok, rt.cfg.vocab_size, 5);
         }
@@ -1785,14 +2269,39 @@ int glm_app_main(int argc, char **argv) {
         } else {
             next = sample_logits_temperature(st.logits, rt.cfg.vocab_size, temperature);
             if (next == rt.cfg.bos_id && rt.cfg.vocab_size > 1) next = (next + 1) % rt.cfg.vocab_size;
-            if (next == rt.cfg.eos_id) break;
-            print_token_safe(&tok, &tok.tokens[next]);
+            if (next == rt.cfg.eos_id) {
+                if (bench_mode == BENCH_MODE_OFF) break;
+                next = (next + 1) % rt.cfg.vocab_size;
+            }
+            if (bench_mode == BENCH_MODE_OFF) print_token_safe(&tok, &tok.tokens[next]);
             generated++;
             if (generated >= n_tokens) break;
         }
         token = next;
     }
-    putchar('\n');
+
+    if (bench_mode == BENCH_MODE_OFF) {
+        putchar('\n');
+    } else {
+        BenchPhaseReport prefill_report = build_phase_report(prefill_lat_ms, prefill_n, model_active_bytes, prefill_cache_sum);
+        BenchPhaseReport decode_report = build_phase_report(decode_lat_ms, decode_n, model_active_bytes, decode_cache_sum);
+        if (bench_mode == BENCH_MODE_FULL || bench_mode == BENCH_MODE_PREFILL) {
+            print_phase_report("prefill", prefill_report);
+        }
+        if (bench_mode == BENCH_MODE_FULL || bench_mode == BENCH_MODE_DECODE) {
+            print_phase_report("decode", decode_report);
+        }
+        write_bench_report_json(bench_report_path,
+                                backend == BACKEND_METAL ? "metal" : "cpu",
+                                bench_mode,
+                                n_prompt,
+                                generated,
+                                prefill_report,
+                                decode_report);
+    }
+
+    free(prefill_lat_ms);
+    free(decode_lat_ms);
 
     glm_backend_free(use_metal);
     free(prompt_ids);
@@ -1800,5 +2309,5 @@ int glm_app_main(int argc, char **argv) {
     runstate_free(&st);
     tokenizer_free(&tok);
     runtime_close(&rt);
-    return 0;
+    return forward_failed ? 1 : 0;
 }

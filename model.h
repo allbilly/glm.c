@@ -164,6 +164,28 @@ typedef enum {
 } BackendType;
 
 int glm_cpu_forward_token(const Runtime *rt, RunState *st, int token, int pos, int debug_mode);
+int glm_cpu_forward_token_checkpoints(const Runtime *rt,
+                                      const RunState *src,
+                                      int token,
+                                      int pos,
+                                      int debug_mode,
+                                      float *layer_out,
+                                      int layer_stride,
+                                      int max_layers,
+                                      int *written_layers);
+int glm_cpu_forward_token_dual_checkpoints(const Runtime *rt,
+                                           const RunState *src,
+                                           int token,
+                                           int pos,
+                                           int debug_mode,
+                                           float *attn_layer_out,
+                                           int attn_layer_stride,
+                                           int max_attn_layers,
+                                           int *written_attn_layers,
+                                           float *layer_out,
+                                           int layer_stride,
+                                           int max_layers,
+                                           int *written_layers);
 int glm_app_main(int argc, char **argv);
 
 #endif

@@ -1,2 +1,3 @@
 *.gguf
 model/*
+glm4.7-flash
