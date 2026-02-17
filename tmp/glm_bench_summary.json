@@ -1,0 +1,52 @@
+{
+  "timestamp_utc": "2026-02-16T18:54:52Z",
+  "tokens": 16,
+  "results": [
+    {
+      "mode": "glm_cpu_decode",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_decode_cpu.time.txt"
+    },
+    {
+      "mode": "glm_metal_decode",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_decode_metal.time.txt"
+    },
+    {
+      "mode": "glm_cpu_tps",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_tps_glm-cpu.time.txt"
+    },
+    {
+      "mode": "glm_metal_tps",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_tps_glm-metal.time.txt"
+    },
+    {
+      "mode": "llama_cpu",
+      "tok_s": null,
+      "json_file": "/Users/mj/Desktop/glm.c/tmp/glm_tps_llama-bench-cpu.json"
+    },
+    {
+      "mode": "llama_metal",
+      "tok_s": null,
+      "json_file": "/Users/mj/Desktop/glm.c/tmp/glm_tps_llama-bench-metal.json"
+    },
+    {
+      "mode": "glm_prefill_cpu_time_s",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_prefill_cpu.time.txt"
+    },
+    {
+      "mode": "glm_prefill_metal_time_s",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_prefill_metal.time.txt"
+    },
+    {
+      "mode": "glm_matvec_proxy_metal",
+      "tok_s": null,
+      "time_file": "/Users/mj/Desktop/glm.c/tmp/glm_matvec_proxy_metal.time.txt"
+    }
+  ],
+  "omp_thread_sweep": []
+}

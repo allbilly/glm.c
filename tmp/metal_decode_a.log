@@ -1,0 +1,2 @@
+[glm-metal] no active Metal feature requested, using CPU-compatible path
+[glm-bench] phase=decode tokens=15 tok_s=1.739 mean_ms=574.920 p50_ms=471.568 p95_ms=1207.412 active_bytes=4528682752 est_bw_gbps=7.877

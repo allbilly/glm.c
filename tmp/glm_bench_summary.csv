@@ -1,0 +1,10 @@
+mode,tok_s_or_seconds,artifact
+glm_cpu_decode,,/Users/mj/Desktop/glm.c/tmp/glm_decode_cpu.time.txt
+glm_metal_decode,,/Users/mj/Desktop/glm.c/tmp/glm_decode_metal.time.txt
+glm_cpu_tps,,/Users/mj/Desktop/glm.c/tmp/glm_tps_glm-cpu.time.txt
+glm_metal_tps,,/Users/mj/Desktop/glm.c/tmp/glm_tps_glm-metal.time.txt
+llama_cpu,,/Users/mj/Desktop/glm.c/tmp/glm_tps_llama-bench-cpu.json
+llama_metal,,/Users/mj/Desktop/glm.c/tmp/glm_tps_llama-bench-metal.json
+glm_prefill_cpu_time_s,,/Users/mj/Desktop/glm.c/tmp/glm_prefill_cpu.time.txt
+glm_prefill_metal_time_s,,/Users/mj/Desktop/glm.c/tmp/glm_prefill_metal.time.txt
+glm_matvec_proxy_metal,,/Users/mj/Desktop/glm.c/tmp/glm_matvec_proxy_metal.time.txt

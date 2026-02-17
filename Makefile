@@ -3,14 +3,16 @@ CFLAGS ?= -O3 -D_FILE_OFFSET_BITS=64
 LDFLAGS ?= -lm
 UNAME_S := $(shell uname -s)
 PROJECT_ROOT := $(abspath .)
+TMP_DIR ?= $(PROJECT_ROOT)/tmp
 MODEL_DIR ?= $(PROJECT_ROOT)/model
 BIN ?= glm4.7-flash
 METAL_SRC ?= infer.metal
 METAL_AIR ?= infer.air
 METAL_LIB ?= infer.metallib
+METAL_OPT ?= release
 OPENMP_PREFIX ?= /opt/homebrew/opt/libomp
 ifndef OPENMP_MODE
-OPENMP_MODE := $(shell tmpc=/tmp/glm_openmp_probe_$$.c; tmpx=/tmp/glm_openmp_probe_$$.bin; \
+OPENMP_MODE := $(shell mkdir -p "$(TMP_DIR)"; tmpc=$(TMP_DIR)/glm_openmp_probe_$$.c; tmpx=$(TMP_DIR)/glm_openmp_probe_$$.bin; \
 	printf 'int main(void){return 0;}\n' > $$tmpc; \
 	if $(CC) -fopenmp $$tmpc -o $$tmpx >/dev/null 2>&1; then \
 		echo native; \
@@ -58,6 +60,14 @@ BLAS_CFLAGS :=
 BLAS_LDFLAGS :=
 endif
 
+ifeq ($(METAL_OPT),debug)
+METAL_OPT_FLAGS := -O0
+else ifeq ($(METAL_OPT),fast)
+METAL_OPT_FLAGS := -Ofast
+else
+METAL_OPT_FLAGS := -O3
+endif
+
 NATIVE_MODEL ?= $(MODEL_DIR)/GLM-4.7-Flash.bin
 GGUF_MODEL ?= $(MODEL_DIR)/GLM-4.7-Flash-Q4_K_M.gguf
 REF_MODEL ?= $(GGUF_MODEL)
@@ -73,6 +83,7 @@ LLAMA_BENCH ?= /opt/homebrew/bin/llama-bench
 EVAL_BACKEND ?= cpu
 EVAL_REF_NGL ?= 0
 BENCH_TOKENS ?= 16
+BENCH_NATIVE_STEADY_TOKENS ?= 4
 BENCH_PROMPT ?= 1+1=
 BENCH_WARMUP ?= 1
 BENCH_OMP_THREADS ?= 8
@@ -86,6 +97,10 @@ METAL_NATIVE ?= 0
 .PHONY: build
 build: $(APP_SOURCES)
 	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -o $(BIN) $(APP_SOURCES) $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
+
+.PHONY: tmp-dir
+tmp-dir:
+	@mkdir -p "$(TMP_DIR)"
 
 .PHONY: openmp-info
 openmp-info:
@@ -125,12 +140,20 @@ check-metal-toolchain:
 
 .PHONY: metal-lib
 metal-lib: check-metal-toolchain $(METAL_SRC)
-	xcrun -sdk macosx metal -std=metal3.0 -O0 -c $(METAL_SRC) -o $(METAL_AIR)
+	xcrun -sdk macosx metal -std=metal3.0 $(METAL_OPT_FLAGS) -c $(METAL_SRC) -o $(METAL_AIR)
 	xcrun -sdk macosx metallib $(METAL_AIR) -o $(METAL_LIB)
 
 .PHONY: build-metal
 build-metal: metal-lib $(METAL_SOURCES)
 	$(CC) $(CFLAGS) $(OPENMP_CFLAGS) $(BLAS_CFLAGS) -DGLM_ENABLE_METAL=1 -x objective-c -fobjc-arc -o $(BIN) $(METAL_SOURCES) -framework Foundation -framework Metal $(LDFLAGS) $(OPENMP_LDFLAGS) $(BLAS_LDFLAGS)
+
+.PHONY: build-metal-debug
+build-metal-debug:
+	$(MAKE) build-metal METAL_OPT=debug
+
+.PHONY: build-metal-fast
+build-metal-fast:
+	$(MAKE) build-metal METAL_OPT=fast
 else
 .PHONY: metal-prereqs
 metal-prereqs:
@@ -165,34 +188,34 @@ smoke-tokenizer: build
 	./glm4.7-flash "$(NATIVE_MODEL)" --self-test-tokenizer
 
 .PHONY: determinism
-determinism: build
-	./glm4.7-flash "$(NATIVE_MODEL)" -n 16 -i "1+1=" > /tmp/glm_out_1.txt
-	./glm4.7-flash "$(NATIVE_MODEL)" -n 16 -i "1+1=" > /tmp/glm_out_2.txt
-	diff -u /tmp/glm_out_1.txt /tmp/glm_out_2.txt
+determinism: build tmp-dir
+	./glm4.7-flash "$(NATIVE_MODEL)" -n 16 -i "1+1=" > "$(TMP_DIR)/glm_out_1.txt"
+	./glm4.7-flash "$(NATIVE_MODEL)" -n 16 -i "1+1=" > "$(TMP_DIR)/glm_out_2.txt"
+	diff -u "$(TMP_DIR)/glm_out_1.txt" "$(TMP_DIR)/glm_out_2.txt"
 
 .PHONY: parity-checklist
-parity-checklist: build-metal
-	./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n 16 -t 0 --seed 0 -i "1+1=" > /tmp/glm_cpu.txt
-	./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n 16 -t 0 --seed 0 -i "1+1=" > /tmp/glm_metal.txt
-	diff -u -I '^  backend=' /tmp/glm_cpu.txt /tmp/glm_metal.txt
+parity-checklist: build-metal tmp-dir
+	./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n 16 -t 0 --seed 0 -i "1+1=" > "$(TMP_DIR)/glm_cpu.txt"
+	./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n 16 -t 0 --seed 0 -i "1+1=" > "$(TMP_DIR)/glm_metal.txt"
+	diff -u -I '^  backend=' "$(TMP_DIR)/glm_cpu.txt" "$(TMP_DIR)/glm_metal.txt"
 
 .PHONY: compare
 compare:
 	$(LLAMA_CLI) -m "$(REF_MODEL)" -ngl 0 -n 16 -p "1+1="
 
 .PHONY: eval-callback-run
-eval-callback-run:
+eval-callback-run: tmp-dir
 	@set -e; \
 	backend="$(EVAL_BACKEND)"; \
-	prompt_file=/tmp/glm_eval_prompt_$${backend}.txt; \
-	native_raw=/tmp/glm_eval_native_$${backend}.log; \
-	ref_raw=/tmp/glm_eval_ref_$${backend}.log; \
-	native_sum=/tmp/glm_eval_native_sums_$${backend}.txt; \
-	ref_sum=/tmp/glm_eval_ref_sums_$${backend}.txt; \
-	native_unsorted=/tmp/glm_eval_native_sums_unsorted_$${backend}.txt; \
-	ref_unsorted=/tmp/glm_eval_ref_sums_unsorted_$${backend}.txt; \
-	missing_native=/tmp/glm_eval_missing_native_$${backend}.txt; \
-	missing_ref=/tmp/glm_eval_missing_ref_$${backend}.txt; \
+	prompt_file="$(TMP_DIR)/glm_eval_prompt_$${backend}.txt"; \
+	native_raw="$(TMP_DIR)/glm_eval_native_$${backend}.log"; \
+	ref_raw="$(TMP_DIR)/glm_eval_ref_$${backend}.log"; \
+	native_sum="$(TMP_DIR)/glm_eval_native_sums_$${backend}.txt"; \
+	ref_sum="$(TMP_DIR)/glm_eval_ref_sums_$${backend}.txt"; \
+	native_unsorted="$(TMP_DIR)/glm_eval_native_sums_unsorted_$${backend}.txt"; \
+	ref_unsorted="$(TMP_DIR)/glm_eval_ref_sums_unsorted_$${backend}.txt"; \
+	missing_native="$(TMP_DIR)/glm_eval_missing_native_$${backend}.txt"; \
+	missing_ref="$(TMP_DIR)/glm_eval_missing_ref_$${backend}.txt"; \
 	printf "Hello" > $$prompt_file; \
 	echo "[glm4.7-flash debug dump backend=$$backend]"; \
 	./glm4.7-flash "$(NATIVE_MODEL)" --backend $$backend -m completion -n 1 --seed 0 --debug -f $$prompt_file > $$native_raw 2>&1; \
@@ -246,8 +269,8 @@ eval-callback-metal: build-metal
 	@$(MAKE) eval-callback-run EVAL_BACKEND=metal EVAL_REF_NGL=99
 
 .PHONY: probe-coherence
-probe-coherence: build
-	@out=/tmp/glm_probe_latest.txt; \
+probe-coherence: build tmp-dir
+	@out="$(TMP_DIR)/glm_probe_latest.txt"; \
 	rm -f "$$out"; \
 	echo "# GLM native coherence probe" >> "$$out"; \
 	echo "# date: $$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$$out"; \
@@ -262,8 +285,8 @@ probe-coherence: build
 	tail -n 80 "$$out"
 
 .PHONY: probe-coherence-core
-probe-coherence-core: build
-	@out=/tmp/glm_probe_core_latest.txt; \
+probe-coherence-core: build tmp-dir
+	@out="$(TMP_DIR)/glm_probe_core_latest.txt"; \
 	rm -f "$$out"; \
 	echo "# GLM native core coherence probe" >> "$$out"; \
 	echo "# date: $$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$$out"; \
@@ -277,26 +300,26 @@ probe-coherence-core: build
 	cat "$$out"
 
 .PHONY: probe-parity-core
-probe-parity-core: build
+probe-parity-core: build tmp-dir
 	python3 "$(PROJECT_ROOT)/probe_parity_core.py" \
 		--native-bin "$(PROJECT_ROOT)/glm4.7-flash" \
 		--native-model "$(NATIVE_MODEL)" \
 		--ref-bin "$(LLAMA_COMPLETION)" \
 		--ref-model "$(REF_MODEL)" \
 		--tokens 8 \
-		--output /tmp/glm_parity_core_latest.txt
+		--output "$(TMP_DIR)/glm_parity_core_latest.txt"
 
 .PHONY: bench-tps
-bench-tps: build-metal
+bench-tps: build-metal tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	glm_cpu_out=/tmp/glm_tps_glm-cpu.txt; \
-	glm_cpu_time=/tmp/glm_tps_glm-cpu.time.txt; \
-	glm_metal_out=/tmp/glm_tps_glm-metal.txt; \
-	glm_metal_time=/tmp/glm_tps_glm-metal.time.txt; \
-	llama_cpu_json=/tmp/glm_tps_llama-bench-cpu.json; \
-	llama_metal_json=/tmp/glm_tps_llama-bench-metal.json; \
+	glm_cpu_out=$(TMP_DIR)/glm_tps_glm-cpu.txt; \
+	glm_cpu_time=$(TMP_DIR)/glm_tps_glm-cpu.time.txt; \
+	glm_metal_out=$(TMP_DIR)/glm_tps_glm-metal.txt; \
+	glm_metal_time=$(TMP_DIR)/glm_tps_glm-metal.time.txt; \
+	llama_cpu_json=$(TMP_DIR)/glm_tps_llama-bench-cpu.json; \
+	llama_metal_json=$(TMP_DIR)/glm_tps_llama-bench-metal.json; \
 	if [ "$(BENCH_WARMUP)" = "1" ]; then \
 		echo "[bench] warmup glm.c cpu"; \
 		env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
@@ -327,18 +350,18 @@ bench-tps: build-metal
 	echo "[artifacts] $$glm_cpu_out $$glm_cpu_time $$glm_metal_out $$glm_metal_time $$llama_cpu_json $$llama_metal_json"
 
 .PHONY: bench-metal-phases
-bench-metal-phases: build-metal
+bench-metal-phases: build-metal tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	cpu_time=/tmp/glm_phase_cpu.time.txt; \
-	metal_time=/tmp/glm_phase_metal.time.txt; \
-	metal_native_time=/tmp/glm_phase_metal_native.time.txt; \
+	cpu_time=$(TMP_DIR)/glm_phase_cpu.time.txt; \
+	metal_time=$(TMP_DIR)/glm_phase_metal.time.txt; \
+	metal_native_time=$(TMP_DIR)/glm_phase_metal_native.time.txt; \
 	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
-		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > /tmp/glm_phase_cpu.txt 2> $$cpu_time; \
-	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > /tmp/glm_phase_metal.txt 2> $$metal_time; \
+		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > $(TMP_DIR)/glm_phase_cpu.txt 2> $$cpu_time; \
+	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $(TMP_DIR)/glm_phase_metal.txt 2> $$metal_time; \
 	if [ "$(METAL_NATIVE)" = "1" ]; then \
-		GLM_METAL_NATIVE=1 /usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > /tmp/glm_phase_metal_native.txt 2> $$metal_native_time; \
+		GLM_METAL_NATIVE=1 /usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $(TMP_DIR)/glm_phase_metal_native.txt 2> $$metal_native_time; \
 	fi; \
 	cpu_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$cpu_time); \
 	metal_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$metal_time); \
@@ -348,15 +371,15 @@ bench-metal-phases: build-metal
 		metal_native_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$metal_native_time); \
 		echo "phase bench metal(native) tok/s=$$metal_native_tps"; \
 	fi; \
-	echo "[artifacts] /tmp/glm_phase_cpu.txt $$cpu_time /tmp/glm_phase_metal.txt $$metal_time /tmp/glm_phase_metal_native.txt $$metal_native_time"
+	echo "[artifacts] $(TMP_DIR)/glm_phase_cpu.txt $$cpu_time $(TMP_DIR)/glm_phase_metal.txt $$metal_time $(TMP_DIR)/glm_phase_metal_native.txt $$metal_native_time"
 
 .PHONY: bench-tps-cpu
-bench-tps-cpu: build
+bench-tps-cpu: build tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	out=/tmp/glm_tps_glm-cpu.txt; \
-	timef=/tmp/glm_tps_glm-cpu.time.txt; \
+	out=$(TMP_DIR)/glm_tps_glm-cpu.txt; \
+	timef=$(TMP_DIR)/glm_tps_glm-cpu.time.txt; \
 	if [ "$(BENCH_WARMUP)" = "1" ]; then \
 		env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
 			./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
@@ -368,12 +391,12 @@ bench-tps-cpu: build
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: bench-tps-metal
-bench-tps-metal: build-metal
+bench-tps-metal: build-metal tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	out=/tmp/glm_tps_glm-metal.txt; \
-	timef=/tmp/glm_tps_glm-metal.time.txt; \
+	out=$(TMP_DIR)/glm_tps_glm-metal.txt; \
+	timef=$(TMP_DIR)/glm_tps_glm-metal.time.txt; \
 	if [ "$(BENCH_WARMUP)" = "1" ]; then \
 		./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
 	fi; \
@@ -383,15 +406,15 @@ bench-tps-metal: build-metal
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: bench-tps-omp
-bench-tps-omp: build
+bench-tps-omp: build tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
 	echo "[bench] OpenMP thread sweep (tokens=$$tokens, prompt='$$prompt')"; \
 	printf "%-8s %8s\n" "threads" "tok/s"; \
 	for t in $(BENCH_OMP_THREAD_LIST); do \
-		out=/tmp/glm_tps_glm-cpu-omp-t$$t.txt; \
-		timef=/tmp/glm_tps_glm-cpu-omp-t$$t.time.txt; \
+		out=$(TMP_DIR)/glm_tps_glm-cpu-omp-t$$t.txt; \
+		timef=$(TMP_DIR)/glm_tps_glm-cpu-omp-t$$t.time.txt; \
 		if [ "$(BENCH_WARMUP)" = "1" ]; then \
 			env OMP_NUM_THREADS=$$t OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
 				./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
@@ -401,67 +424,67 @@ bench-tps-omp: build
 		tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$timef); \
 		printf "%-8s %8s\n" $$t $$tps; \
 	done; \
-	echo "[artifacts] /tmp/glm_tps_glm-cpu-omp-t*.txt /tmp/glm_tps_glm-cpu-omp-t*.time.txt"
+	echo "[artifacts] $(TMP_DIR)/glm_tps_glm-cpu-omp-t*.txt $(TMP_DIR)/glm_tps_glm-cpu-omp-t*.time.txt"
 
 .PHONY: bench-prefill-cpu
-bench-prefill-cpu: build
+bench-prefill-cpu: build tmp-dir
 	@set -e; \
 	prompt="$(BENCH_PREFILL_PROMPT)"; \
-	out=/tmp/glm_prefill_cpu.txt; \
-	timef=/tmp/glm_prefill_cpu.time.txt; \
+	out=$(TMP_DIR)/glm_prefill_cpu.txt; \
+	timef=$(TMP_DIR)/glm_prefill_cpu.time.txt; \
 	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
 		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n 0 -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
 	echo "prefill cpu done"; \
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: bench-prefill-metal
-bench-prefill-metal: build-metal
+bench-prefill-metal: build-metal tmp-dir
 	@set -e; \
 	prompt="$(BENCH_PREFILL_PROMPT)"; \
-	out=/tmp/glm_prefill_metal.txt; \
-	timef=/tmp/glm_prefill_metal.time.txt; \
+	out=$(TMP_DIR)/glm_prefill_metal.txt; \
+	timef=$(TMP_DIR)/glm_prefill_metal.time.txt; \
 	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 0 -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
 	echo "prefill metal done"; \
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: bench-decode-cpu
-bench-decode-cpu: build
+bench-decode-cpu: build tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	out=/tmp/glm_decode_cpu.txt; \
-	timef=/tmp/glm_decode_cpu.time.txt; \
+	out=$(TMP_DIR)/glm_decode_cpu.txt; \
+	timef=$(TMP_DIR)/glm_decode_cpu.time.txt; \
 	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
 		/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
 	echo "decode cpu done"; \
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: bench-decode-metal
-bench-decode-metal: build-metal
+bench-decode-metal: build-metal tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	out=/tmp/glm_decode_metal.txt; \
-	timef=/tmp/glm_decode_metal.time.txt; \
+	out=$(TMP_DIR)/glm_decode_metal.txt; \
+	timef=$(TMP_DIR)/glm_decode_metal.time.txt; \
 	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
 	echo "decode metal done"; \
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: bench-kernel-matvec
-bench-kernel-matvec: build-metal
+bench-kernel-matvec: build-metal tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	out=/tmp/glm_matvec_proxy_metal.txt; \
-	timef=/tmp/glm_matvec_proxy_metal.time.txt; \
+	out=$(TMP_DIR)/glm_matvec_proxy_metal.txt; \
+	timef=$(TMP_DIR)/glm_matvec_proxy_metal.time.txt; \
 	/usr/bin/time -p ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$out 2> $$timef; \
 	echo "matvec proxy benchmark done (full decode path; use for relative kernel tuning only)"; \
 	echo "[artifacts] $$out $$timef"
 
 .PHONY: capture-metal
-capture-metal: build-metal
+capture-metal: build-metal tmp-dir
 	@set -e; \
-	out=/tmp/glm_metal_capture.txt; \
+	out=$(TMP_DIR)/glm_metal_capture.txt; \
 	echo "Running with MTL_CAPTURE_ENABLED=1 ..."; \
 	MTL_CAPTURE_ENABLED=1 ./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 8 -t 0 --seed 0 -i "$(CAPTURE_PROMPT)" > $$out; \
 	echo "Capture run complete."; \
@@ -469,9 +492,9 @@ capture-metal: build-metal
 	echo "[artifact] $$out"
 
 .PHONY: bench-summary
-bench-summary:
-	BENCH_TOKENS=$(BENCH_TOKENS) python3 scripts/bench_summary.py
-	@echo "[artifacts] /tmp/glm_bench_summary.json /tmp/glm_bench_summary.csv"
+bench-summary: tmp-dir
+	BENCH_TOKENS=$(BENCH_TOKENS) GLM_TMP_DIR="$(TMP_DIR)" python3 scripts/bench_summary.py
+	@echo "[artifacts] $(TMP_DIR)/glm_bench_summary.json $(TMP_DIR)/glm_bench_summary.csv"
 
 .PHONY: clean
 clean:
@@ -522,19 +545,68 @@ bench-micro-matvec-compare: build-metal
 
 # Per-token latency benchmark targets
 .PHONY: bench-latency-full
-bench-latency-full: build-metal
+bench-latency-full: build-metal tmp-dir
 	@./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) \
-		--bench-mode full -i "$(BENCH_PROMPT)" --bench-report /tmp/glm_bench_full.json
-	@echo "[artifact] /tmp/glm_bench_full.json"
+		--bench-mode full -i "$(BENCH_PROMPT)" --bench-report "$(TMP_DIR)/glm_bench_full.json"
+	@echo "[artifact] $(TMP_DIR)/glm_bench_full.json"
 
 .PHONY: bench-latency-decode
-bench-latency-decode: build-metal
+bench-latency-decode: build-metal tmp-dir
 	@./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) \
-		--bench-mode decode -i "$(BENCH_PROMPT)" --bench-report /tmp/glm_bench_decode.json
-	@echo "[artifact] /tmp/glm_bench_decode.json"
+		--bench-mode decode -i "$(BENCH_PROMPT)" --bench-report "$(TMP_DIR)/glm_bench_decode.json"
+	@echo "[artifact] $(TMP_DIR)/glm_bench_decode.json"
 
 .PHONY: bench-latency-prefill
-bench-latency-prefill: build-metal
+bench-latency-prefill: build-metal tmp-dir
 	@./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 0 \
-		--bench-mode prefill -i "$(BENCH_PREFILL_PROMPT)" --bench-report /tmp/glm_bench_prefill.json
-	@echo "[artifact] /tmp/glm_bench_prefill.json"
+		--bench-mode prefill -i "$(BENCH_PREFILL_PROMPT)" --bench-report "$(TMP_DIR)/glm_bench_prefill.json"
+	@echo "[artifact] $(TMP_DIR)/glm_bench_prefill.json"
+
+.PHONY: bench-native-fast-profile
+bench-native-fast-profile: build-metal tmp-dir
+	@set -e; \
+	prompt="$(BENCH_PROMPT)"; \
+	first_json="$(TMP_DIR)/glm_native_fast_decode_first.json"; \
+	steady_json="$(TMP_DIR)/glm_native_fast_decode_steady.json"; \
+	first_log="$(TMP_DIR)/glm_native_fast_decode_first.log"; \
+	steady_log="$(TMP_DIR)/glm_native_fast_decode_steady.log"; \
+	echo "[bench] native-fast first decode token"; \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 2 -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$first_json" > "$$first_log" 2>&1; \
+	echo "[bench] native-fast steady decode estimate"; \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_NATIVE_STEADY_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$steady_json" > "$$steady_log" 2>&1; \
+	first_tps=$$(F="$$first_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
+	steady_tps=$$(F1="$$first_json" F2="$$steady_json" python3 -c "import json, os; d1=json.load(open(os.environ['F1']))['decode']; d2=json.load(open(os.environ['F2']))['decode']; t1=(1.0/d1['tok_s']) if d1['tok_s']>0 else float('inf'); n2=max(int(d2['tokens']),1); avg=(1.0/d2['tok_s']) if d2['tok_s']>0 else float('inf'); tail=(n2*avg-t1)/max(n2-1,1); out=(1.0/tail) if tail>0 and tail<float('inf') else 0.0; print(f\"{out:.3f}\")"); \
+	echo "native-fast decode first-token tok/s=$$first_tps"; \
+	echo "native-fast decode steady-state tok/s=$$steady_tps (tail estimate, n=$(BENCH_NATIVE_STEADY_TOKENS))"; \
+	echo "[artifacts] $$first_json $$steady_json $$first_log $$steady_log"
+
+.PHONY: bench-native-fast-matrix
+bench-native-fast-matrix: build-metal tmp-dir
+	@set -e; \
+	prompt="$(BENCH_PROMPT)"; \
+	cpu_json="$(TMP_DIR)/glm_cpu_decode_matrix.json"; \
+	metal_json="$(TMP_DIR)/glm_metal_decode_matrix.json"; \
+	native_first_json="$(TMP_DIR)/glm_native_fast_decode_first.json"; \
+	native_steady_json="$(TMP_DIR)/glm_native_fast_decode_steady.json"; \
+	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+		./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $(BENCH_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$cpu_json" > "$(TMP_DIR)/glm_cpu_decode_matrix.log" 2>&1; \
+	./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$metal_json" > "$(TMP_DIR)/glm_metal_decode_matrix.log" 2>&1; \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 2 -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$native_first_json" > "$(TMP_DIR)/glm_native_fast_decode_first.log" 2>&1; \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_NATIVE_STEADY_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$native_steady_json" > "$(TMP_DIR)/glm_native_fast_decode_steady.log" 2>&1; \
+	cpu_tps=$$(F="$$cpu_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
+	metal_tps=$$(F="$$metal_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
+	native_first_tps=$$(F="$$native_first_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
+	native_steady_tps=$$(F1="$$native_first_json" F2="$$native_steady_json" python3 -c "import json, os; d1=json.load(open(os.environ['F1']))['decode']; d2=json.load(open(os.environ['F2']))['decode']; t1=(1.0/d1['tok_s']) if d1['tok_s']>0 else float('inf'); n2=max(int(d2['tokens']),1); avg=(1.0/d2['tok_s']) if d2['tok_s']>0 else float('inf'); tail=(n2*avg-t1)/max(n2-1,1); out=(1.0/tail) if tail>0 and tail<float('inf') else 0.0; print(f\"{out:.3f}\")"); \
+	progress_pct=$$(T="$$native_steady_tps" python3 -c "import os; t=float(os.environ['T']); print(f\"{(100.0*t/20.0):.1f}\")"); \
+	echo "decode matrix (tokens=$(BENCH_TOKENS), prompt='$$prompt')"; \
+	printf "%-34s %8s\n" "mode" "tok/s"; \
+	printf "%-34s %8s\n" "cpu decode (omp=$(BENCH_OMP_THREADS))" "$$cpu_tps"; \
+	printf "%-34s %8s\n" "metal decode (default path)" "$$metal_tps"; \
+	printf "%-34s %8s\n" "metal native-fast (first token)" "$$native_first_tps"; \
+	printf "%-34s %8s\n" "metal native-fast (steady decode est)" "$$native_steady_tps"; \
+	echo "progress toward 20 tok/s: $$progress_pct%"; \
+	echo "[artifacts] $$cpu_json $$metal_json $$native_first_json $$native_steady_json"

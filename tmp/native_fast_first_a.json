@@ -1,0 +1,24 @@
+{
+  "backend": "metal",
+  "mode": "decode",
+  "prompt_tokens": 1,
+  "generated_tokens": 2,
+  "prefill": {
+    "tokens": 1,
+    "tok_s": 0.006112,
+    "mean_ms": 163601.606000,
+    "p50_ms": 163601.606000,
+    "p95_ms": 163601.606000,
+    "active_bytes": 4495955712,
+    "est_bw_gbps": 0.027481
+  },
+  "decode": {
+    "tokens": 1,
+    "tok_s": 0.006103,
+    "mean_ms": 163852.470000,
+    "p50_ms": 163852.470000,
+    "p95_ms": 163852.470000,
+    "active_bytes": 4500046592,
+    "est_bw_gbps": 0.027464
+  }
+}

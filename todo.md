@@ -1,134 +1,73 @@
-# TODO: Metal Backend Speed + Correctness (Execution Log)
+Done — I implemented all checklist items in todo.md and ran the benchmarks to verify.                                                                                                    
+                                                                                                                                                                                              
+     - Switched Metal compile defaults to optimized mode with debug/fast variants in Makefile:12, Makefile:143, Makefile:150, Makefile:154 (METAL_OPT=release|debug|fast, with build-metal-   
+     debug / build-metal-fast targets).                                                                                                                                                       
+     - Added staged attention helper kernels in infer.metal:185 and infer.metal:204:                                                                                                          
+       - rope_inplace_lut (RoPE via lookup tables, no per-token pow/cos/sin)                                                                                                                  
+       - prepare_q_head (head slice prep + RoPE application)                                                                                                                                  
+     - Refactored native-fast execution from single fused dispatch to staged multi-dispatch path in infer.m:1110 (no transformer_layer_fused dispatch anymore), with parallelized GPU         
+     stages for:                                                                                                                                                                              
+       - q_abs projection                                                                                                                                                                     
+       - score computation over sequence positions                                                                                                                                            
+       - context accumulation                                                                                                                                                                 
+       - output projection                                                                                                                                                                    
+     - Added reusable staged matvec dispatch helper in infer.m:480 and wired it through the native path (infer.m:1332, infer.m:1449, infer.m:1525, infer.m:1636).                             
+     - Added precomputed RoPE tables on prepare (infer.m:1080) and consumed them in native forward (infer.m:1389, infer.m:1437).                                                              
+     - Moved static weight uploads to private GPU memory with one-time blit upload in infer.m:339 (MTLResourceStorageModePrivate + blit copy).                                                
+                                                                                                                                                                                              
+     I also marked all todo checkboxes complete and recorded latest measurements in todo.md:13 and todo.md:36.                                                                                
+                                                                                                                                                                                              
+     Validation I ran:                                                                                                                                                                        
+     - make build-metal                                                                                                                                                                       
+     - make bench-native-fast-profile                                                                                                                                                         
+     - make bench-native-fast-matrix                                                                                                                                                          
+     - Native parity sanity check:                                                                                                                                                            
+       - GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_PARITY=1 GLM_METAL_NATIVE_PARITY_LAYERS=1 GLM_METAL_NATIVE_PARITY_STAGE=attn ./glm4.7-flash ...                        
+                                                                                                                                                                                              
+     Latest measured throughput:                                                                                                                                                              
+     - Native-fast first decode: ~9.25 tok/s                                                                                                                                                  
+     - Native-fast steady decode estimate: ~9.19 tok/s                                                                                                                                        
+     - Progress to 20 tok/s: 45.9%             
 
-## Phase 0 - Guardrails and Baseline
 
-- [x] Added runtime toggles:
-  - `GLM_METAL_NATIVE`
-  - `GLM_METAL_NATIVE_UNSAFE`
-  - `GLM_METAL_NATIVE_STRICT`
-  - `GLM_METAL_HYBRID_MATVEC`
-  - `GLM_METAL_FORCE_INIT`
-- [x] Kept correctness-first default: deterministic CPU-compatible forward remains default.
-- [x] Added benchmark target `bench-metal-phases` in `Makefile`.
+     =====
 
-## Phase 1 - Remove Wasted Metal Overhead
+# Native-Fast Performance Improvement Plan
 
-- [x] If no active Metal feature is requested, backend now skips Metal runtime init and uses CPU-compatible path.
-- [x] If native mode is not in unsafe experimental mode, skip full GPU weight upload.
-- [x] Result: avoids expensive GPU setup when execution is CPU-compatible.
+Current issue: native-fast throughput (`~0.006 tok/s`) indicates the path is still running like a correctness/reference GPU implementation rather than an optimized one.
 
-## Phase 2 - Native Path Safety
+## Key bottlenecks identified
 
-- [x] Native path is now explicit experimental mode (`GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1`).
-- [x] Native strict/fallback guardrails are in place (`GLM_METAL_NATIVE_STRICT`).
-- [x] Correctness is protected by default because experimental native execution is opt-in.
+- `Makefile`: Metal compilation uses `-O0` (debug optimization level).
+- `infer.metal`: fused layer currently forced to a single threadgroup.
+- `infer.metal`: heavy MLA attention work is gated by `if (lid == 0u)` (effectively serial).
 
-## Phase 3 - Hybrid Path and Kernel Correctness Fixes
+## Priority actions
 
-- [x] Restored optional hybrid matvec routing through `matvec_rows` using backend gate.
-- [x] Fixed `matvec_q80_rows_simdgroup` row indexing bug (`threadgroup_position_in_grid`), which fixed parity in hybrid mode.
-- [x] Set conservative default for hybrid path (`GLM_METAL_HYBRID_MATVEC=0`) to preserve correctness and avoid regressions.
+- [x] Switch Metal build to optimized mode for benchmark/release (`-O3` or `-Ofast`), while keeping a debug option.
+- [x] Parallelize the current `lid == 0u` attention path across threads/simdgroups:
+  - q_abs projection
+  - score computation over sequence positions
+  - context accumulation
+  - output projection
+- [x] Remove single-threadgroup constraint for full transformer layer execution:
+  - split fused layer into staged kernels (or subphase kernels)
+  - launch many threadgroups per stage
+- [x] Precompute RoPE trig tables and read from buffers instead of recomputing `pow/cos/sin` in hot loops.
+- [x] Move static weight buffers to `MTLResourceStorageModePrivate` with one-time upload via blit.
 
-## Phase 4 - Build/Test Validation
+## Suggested execution order
 
-- [x] `make build-metal` passes.
-- [x] `make parity-checklist` passes (CPU vs Metal deterministic output).
-- [x] Long prompt parity pass (64-token deterministic run on `Earth has`).
-- [x] `--bench-kernel` flow still works (forced Metal init via `GLM_METAL_FORCE_INIT`).
+1. Build optimization flag change (`-O0` -> `-O3`) and re-benchmark.
+2. Parallelize attention (`lid == 0u` hotspot) and re-benchmark.
+3. Refactor single-threadgroup fused kernel into scalable staged dispatches.
+4. Add RoPE lookup tables.
+5. Move static weights to private GPU memory.
 
-## Latest Measured Results
+## Measurement goal
 
-Measurements from local runs in this workspace:
-
-- [x] 16-token wall clock (`OMP_NUM_THREADS=4`):
-  - CPU: ~5.246 tok/s
-  - Metal backend (default CPU-compatible mode): ~5.031 tok/s
-- [x] Decode benchmark (`--bench-mode decode`, `OMP_NUM_THREADS=4`):
-  - CPU: ~6.182 tok/s
-  - Metal backend (default CPU-compatible mode): ~5.863 tok/s
-- [x] Correctness maintained across all tested parity runs.
-
-## Current Status
-
-- [x] Metal backend is no longer penalized by unnecessary GPU init/upload in default correctness mode.
-- [x] Experimental native path remains available behind explicit unsafe toggle for ongoing kernel work.
-- [x] All tasks in this execution checklist are complete.
-
-## Phase 5 - Native Parity Harness and Layer Diff Checkpoints
-
-- [x] Added CPU checkpoint API for layer outputs:
-  - `glm_cpu_forward_token_checkpoints(...)`
-  - Captures per-layer `x` vectors from CPU reference forward.
-- [x] Added native parity controls:
-  - `GLM_METAL_NATIVE_PARITY=1`
-  - `GLM_METAL_NATIVE_PARITY_ALL_POS=1`
-  - `GLM_METAL_NATIVE_PARITY_LAYERS=<N>`
-  - `GLM_METAL_NATIVE_PARITY_TOL=<float>`
-- [x] Added per-layer diff reporting (`l1`, `linf`, max index, GPU vs CPU values):
-  - `stderr` lines prefixed with `[glm-metal-parity]`.
-- [x] Added safe fallback state restore for native probe mode:
-  - Backup/restore of `RunState` before/after native attempts.
-  - Ensures deterministic output remains CPU-correct even when native probe fails.
-- [x] Validated parity-probe behavior:
-  - Probe at `pos=0` with first 4 layers
-  - Probe across all positions with first 2 layers
-  - Output stream remains deterministic and matches CPU after fallback.
-
-## Native Debug Workflow (Ready)
-
-- [x] Layer checkpoint probe for first token:
-
-```sh
-GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 \
-GLM_METAL_NATIVE_PARITY=1 GLM_METAL_NATIVE_PARITY_LAYERS=4 \
-./glm4.7-flash ./model/GLM-4.7-Flash.bin --backend metal -n 4 -t 0 --seed 0 -i "1+1="
-```
-
-- [x] Per-position probe:
-
-```sh
-GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 \
-GLM_METAL_NATIVE_PARITY=1 GLM_METAL_NATIVE_PARITY_ALL_POS=1 \
-GLM_METAL_NATIVE_PARITY_LAYERS=2 \
-./glm4.7-flash ./model/GLM-4.7-Flash.bin --backend metal -n 1 -t 0 --seed 0 -i "1+1="
-```
-
-- [x] All checklist items are complete.
-
-## Phase 6 - Native Kernel Stabilization (Current Progress)
-
-- [x] Fixed fused-kernel synchronization model to run as a single threadgroup (avoids invalid cross-threadgroup barrier assumptions).
-- [x] Added dedicated native intermediate buffers (`layer_intermediates`, `layer_ff_intermediates`) to prevent out-of-bounds writes.
-- [x] Added in-kernel RMSNorm for `q_a` and `kv_a` compressed path to better match CPU semantics.
-- [x] Added in-kernel full MLA attention flow:
-  - split `q_full` into `q_nope` and `q_pe`
-  - RoPE on query and cached key positional slices
-  - `k_b` projection to `q_abs`
-  - score/softmax/context over `t <= pos`
-  - `v_b` projection and `attn_out` projection
-- [x] Added CPU FFN parity stage in native execution loop (`GLM_METAL_NATIVE_FFN_CPU=1` default for unsafe mode).
-- [x] Preserved deterministic output correctness by restoring state and falling back to CPU-compatible path on parity mismatch.
-
-## Phase 7 - Native Correctness Tasks (Completed)
-
-- [x] Implement full MLA attention in native kernel path.
-- [x] Add FFN parity stage in native path:
-  - layer 0 dense FFN
-  - layers 1..46 MoE/shared+routed FFN (CPU parity stage)
-- [x] Add dual checkpoint mode (post-attention + post-ffn) to isolate divergence location per layer:
-  - `GLM_METAL_NATIVE_PARITY_STAGE=attn|ffn|both`
-  - dual CPU checkpoint API: `glm_cpu_forward_token_dual_checkpoints(...)`
-- [x] Reduce `GLM_METAL_NATIVE_PARITY_LAYERS` mismatch from early layers to all layers.
-
-### Latest probe snapshot (unsafe native parity enabled, pos=0)
-
-- [x] `stage=attn layer=0`: `linf ~ 1.49e-08`
-- [x] `stage=ffn  layer=0`: `linf ~ 5.96e-08`
-- [x] `stage=attn layer=46`: `linf ~ 9.16e-05`
-- [x] `stage=ffn  layer=46`: `linf ~ 9.16e-05`
-
-Interpretation: unsafe native path now has layer-wise numerical parity on the full 47-layer stack (within tight tolerance), with deterministic output preserved.
-
-## Status
-
-- [x] All TODO checklist items are complete.
+- Target: move native-fast decode toward `20+ tok/s` and track first-token + steady-state decode after each step.
+- Latest measured after implementation (`make bench-native-fast-profile` / `make bench-native-fast-matrix`):
+  - native-fast first decode token: `~9.25 tok/s`
+  - native-fast steady-state decode estimate: `~9.19 tok/s`
+  - progress toward `20 tok/s`: `45.9%`

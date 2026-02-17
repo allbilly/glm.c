@@ -28,11 +28,14 @@ static int g_cfg_hybrid_matvec = -1;
 static int g_cfg_native_strict = -1;
 static int g_cfg_native_unsafe = -1;
 static int g_cfg_native_ffn_cpu = -1;
+static int g_cfg_native_backup = -1;
 static int g_cfg_native_parity = -1;
 static int g_cfg_native_parity_all_pos = -1;
 static int g_cfg_native_parity_layers = -1;
 static int g_cfg_native_parity_stage = -2;
 static float g_cfg_native_parity_tol = -1.0f;
+static int g_cfg_native_layer_tgs = -1;
+static int g_cfg_matvec_simd_tgs = -1;
 static int g_warned_native_requires_unsafe = 0;
 static int g_omp_tuned = 0;
 
@@ -82,6 +85,43 @@ static float env_float_cached(const char *name, float *slot, float default_value
     return *slot;
 }
 
+static unsigned int aligned_threadgroup_size(id<MTLComputePipelineState> ps,
+                                             int requested,
+                                             unsigned int default_value,
+                                             unsigned int min_value) {
+    NSUInteger max_threads = ps ? ps.maxTotalThreadsPerThreadgroup : default_value;
+    NSUInteger simd_width = ps ? ps.threadExecutionWidth : 32u;
+    if (max_threads == 0u) max_threads = default_value;
+    if (simd_width == 0u) simd_width = 32u;
+
+    unsigned int target = requested > 0 ? (unsigned int)requested : default_value;
+    if (target < min_value) target = min_value;
+    if (target > (unsigned int)max_threads) target = (unsigned int)max_threads;
+
+    unsigned int simd = (unsigned int)simd_width;
+    target = (target / simd) * simd;
+    if (target < simd) target = simd;
+    if (target < min_value) target = min_value;
+    if (target > (unsigned int)max_threads) {
+        target = (unsigned int)max_threads;
+        target = (target / simd) * simd;
+        if (target < simd) target = simd;
+    }
+    return target;
+}
+
+static unsigned int matvec_simdgroup_tgs(id<MTLComputePipelineState> ps) {
+    int requested = env_int_cached("GLM_METAL_MATVEC_SIMDGROUP_TGS", &g_cfg_matvec_simd_tgs, 0);
+    return aligned_threadgroup_size(ps, requested, 128u, 32u);
+}
+
+static unsigned int matvec_rows_per_threadgroup(id<MTLComputePipelineState> ps, unsigned int tgs) {
+    NSUInteger simd_width = ps ? ps.threadExecutionWidth : 32u;
+    if (simd_width == 0u) simd_width = 32u;
+    unsigned int rows = tgs / (unsigned int)simd_width;
+    return rows > 0u ? rows : 1u;
+}
+
 static int metal_native_enabled(void) {
     return env_flag_cached("GLM_METAL_NATIVE", &g_cfg_native, 0);
 }
@@ -99,7 +139,11 @@ static int metal_native_unsafe_enabled(void) {
 }
 
 static int metal_native_ffn_cpu_enabled(void) {
-    return env_flag_cached("GLM_METAL_NATIVE_FFN_CPU", &g_cfg_native_ffn_cpu, 1);
+    return env_flag_cached("GLM_METAL_NATIVE_FFN_CPU", &g_cfg_native_ffn_cpu, 0);
+}
+
+static int metal_native_backup_enabled(void) {
+    return env_flag_cached("GLM_METAL_NATIVE_BACKUP", &g_cfg_native_backup, 0);
 }
 
 static int metal_native_parity_enabled(void) {
@@ -139,6 +183,13 @@ static int metal_native_parity_stage(void) {
 
 static float metal_native_parity_tol(void) {
     return env_float_cached("GLM_METAL_NATIVE_PARITY_TOL", &g_cfg_native_parity_tol, 1e-3f);
+}
+
+static unsigned int metal_native_layer_tgs(id<MTLComputePipelineState> ps, const RuntimeConfig *cfg) {
+    int requested = env_int_cached("GLM_METAL_NATIVE_LAYER_TGS", &g_cfg_native_layer_tgs, 0);
+    unsigned int default_tgs = 256u;
+    (void)cfg;
+    return aligned_threadgroup_size(ps, requested, default_tgs, 32u);
 }
 
 static void metal_tune_omp_if_needed(void) {
@@ -186,6 +237,8 @@ typedef struct {
     id<MTLBuffer> moe_out_acc;
     id<MTLBuffer> moe_topk_idx;
     id<MTLBuffer> moe_topk_w;
+    id<MTLBuffer> rope_cos;
+    id<MTLBuffer> rope_sin;
 } MetalRunStateBuffers;
 
 // Layer-specific GPU buffers
@@ -235,6 +288,7 @@ static MetalRunStateBuffers g_run = {0};
 static MetalModelBuffers g_model = {0};
 static MetalLayerBuffers *g_layers = NULL;
 static int g_n_layers = 0;
+static uint32_t g_rope_half_dim = 0;
 
 static id<MTLBuffer> make_shared_buffer(NSUInteger length, const char *name) {
     if (length == 0) return nil;
@@ -277,9 +331,32 @@ static id<MTLBuffer> cached_nocopy_buffer(const void *ptr, NSUInteger length, co
 // Upload quantized weights to GPU (copy since weights are read-only)
 static id<MTLBuffer> upload_weight_buffer(const void *host_ptr, NSUInteger length, const char *name) {
     if (!host_ptr || length == 0) return nil;
-    id<MTLBuffer> buf = [g_device newBufferWithBytes:host_ptr length:length options:MTLResourceStorageModeShared];
-    if (!buf) {
+    id<MTLBuffer> staging = [g_device newBufferWithBytes:host_ptr length:length options:MTLResourceStorageModeShared];
+    if (!staging) {
         fprintf(stderr, "[glm-metal] failed to upload weight buffer %s (%lu bytes)\n", name, (unsigned long)length);
+        return nil;
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithLength:length options:MTLResourceStorageModePrivate];
+    if (!buf) {
+        fprintf(stderr, "[glm-metal] failed to allocate private weight buffer %s (%lu bytes)\n", name, (unsigned long)length);
+        return nil;
+    }
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) {
+        fprintf(stderr, "[glm-metal] failed to create upload command buffer for %s\n", name);
+        return nil;
+    }
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) {
+        fprintf(stderr, "[glm-metal] failed to create blit encoder for %s\n", name);
+        return nil;
+    }
+    [blit copyFromBuffer:staging sourceOffset:0 toBuffer:buf destinationOffset:0 size:length];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.error) {
+        fprintf(stderr, "[glm-metal] weight upload blit failed for %s: %s\n", name, cb.error.localizedDescription.UTF8String);
         return nil;
     }
     return buf;
@@ -368,6 +445,61 @@ static void dispatch(id<MTLComputeCommandEncoder> encoder, const char *name,
                      unsigned int tgs_count, unsigned int tgs,
                      const void *params, size_t params_size, void **buffers, size_t buffer_count) {
     dispatch2(encoder, name, tgs_count, 1, tgs, params, params_size, buffers, buffer_count);
+}
+
+typedef struct {
+    uint32_t rows;
+    uint32_t dim;
+    uint32_t gs;
+} MetalMatvecArgs;
+
+typedef struct {
+    uint32_t n;
+} MetalVecArgs;
+
+typedef struct {
+    uint32_t dst_base;
+    uint32_t width;
+} MetalCacheWriteArgs;
+
+typedef struct {
+    uint32_t dim;
+    uint32_t pos;
+    uint32_t half_dim;
+} MetalRopeLutArgs;
+
+typedef struct {
+    uint32_t qk_nope_dim;
+    uint32_t rope_dim;
+    uint32_t head_k_dim;
+    uint32_t head_idx;
+    uint32_t pos;
+    uint32_t rope_half_dim;
+} MetalHeadSliceArgs;
+
+static void dispatch_matvec_simdgroup(id<MTLComputeCommandEncoder> encoder,
+                                      id<MTLComputePipelineState> ps,
+                                      MetalMatvecArgs args,
+                                      id<MTLBuffer> q_buf,
+                                      NSUInteger q_off,
+                                      id<MTLBuffer> s_buf,
+                                      NSUInteger s_off,
+                                      id<MTLBuffer> x_buf,
+                                      NSUInteger x_off,
+                                      id<MTLBuffer> y_buf,
+                                      NSUInteger y_off) {
+    if (!encoder || !ps) return;
+    const unsigned int tgs = matvec_simdgroup_tgs(ps);
+    const unsigned int rows_per_tg = matvec_rows_per_threadgroup(ps, tgs);
+    const unsigned int tgx = (args.rows + rows_per_tg - 1u) / rows_per_tg;
+    [encoder setComputePipelineState:ps];
+    [encoder setBytes:&args length:sizeof(args) atIndex:0];
+    [encoder setBuffer:q_buf offset:q_off atIndex:1];
+    [encoder setBuffer:s_buf offset:s_off atIndex:2];
+    [encoder setBuffer:x_buf offset:x_off atIndex:3];
+    [encoder setBuffer:y_buf offset:y_off atIndex:4];
+    [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
 }
 
 // CPU helper functions for native forward
@@ -754,6 +886,8 @@ int glm_metal_init(const Runtime *rt, RunState *st) {
         "matvec_q80_rows",
         "matvec_q80_rows_simdgroup",
         "rope_inplace",
+        "rope_inplace_lut",
+        "prepare_q_head",
         "softmax_1d",
         "vec_add_inplace",
         "silu_mul_inplace",
@@ -768,9 +902,6 @@ int glm_metal_init(const Runtime *rt, RunState *st) {
     };
     for (int i = 0; required[i] != NULL; i++) {
         if (ensure_pipeline(required[i]) != 0) return -1;
-    }
-    if (metal_native_enabled()) {
-        if (ensure_pipeline("transformer_layer_fused") != 0) return -1;
     }
 
     g_ps_matvec = g_pipelines[@"matvec_q80_rows_simdgroup"];
@@ -795,10 +926,12 @@ int glm_metal_init(const Runtime *rt, RunState *st) {
     if (!g_model.output_norm || !g_model.tok_q || !g_model.tok_s || !g_model.out_q || !g_model.out_s) return -1;
 
     fprintf(stderr,
-            "[glm-metal] initialized device=%s native=%s native_unsafe=%s hybrid_matvec=%s\n",
+            "[glm-metal] initialized device=%s native=%s native_unsafe=%s native_ffn_cpu=%s native_backup=%s hybrid_matvec=%s\n",
             g_device.name.UTF8String,
             metal_native_enabled() ? "on" : "off",
             metal_native_unsafe_enabled() ? "on" : "off",
+            metal_native_ffn_cpu_enabled() ? "on" : "off",
+            metal_native_backup_enabled() ? "on" : "off",
             metal_hybrid_matvec_enabled() ? "on" : "off");
     return 0;
 }
@@ -941,6 +1074,30 @@ void glm_metal_prepare(const Runtime *rt, RunState *st) {
     g_run.moe_topk_idx = make_shared_buffer((NSUInteger)cfg->n_experts_used * sizeof(int), "moe_topk_idx");
     g_run.moe_topk_w = make_shared_buffer((NSUInteger)cfg->n_experts_used * sizeof(float), "moe_topk_w");
 
+    g_rope_half_dim = (cfg->rope_dim > 1) ? (uint32_t)(cfg->rope_dim / 2) : 0u;
+    if (g_rope_half_dim > 0u) {
+        NSUInteger rope_elems = (NSUInteger)st->cache_cap * (NSUInteger)g_rope_half_dim;
+        g_run.rope_cos = make_shared_buffer(rope_elems * sizeof(float), "rope_cos");
+        g_run.rope_sin = make_shared_buffer(rope_elems * sizeof(float), "rope_sin");
+        if (!g_run.rope_cos || !g_run.rope_sin) {
+            fprintf(stderr, "[glm-metal] failed to allocate rope lookup tables\n");
+            return;
+        }
+        float *cos_lut = (float *)g_run.rope_cos.contents;
+        float *sin_lut = (float *)g_run.rope_sin.contents;
+        const float base = 1000000.0f;
+        for (int p = 0; p < st->cache_cap; p++) {
+            for (uint32_t k = 0; k < g_rope_half_dim; k++) {
+                uint32_t i = k * 2u;
+                float freq = powf(base, -((float)i / (float)cfg->rope_dim));
+                float ang = (float)p * freq;
+                size_t idx = (size_t)p * (size_t)g_rope_half_dim + (size_t)k;
+                cos_lut[idx] = cosf(ang);
+                sin_lut[idx] = sinf(ang);
+            }
+        }
+    }
+
     if (!g_run.layer_intermediates || !g_run.layer_ff_intermediates) {
         fprintf(stderr, "[glm-metal] failed to allocate native layer intermediate buffers\n");
         return;
@@ -960,21 +1117,54 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
         fprintf(stderr, "[glm-metal] native forward: weights not uploaded\n");
         return -1;
     }
-    
-    // Get pipeline for fused layer kernel
-    id<MTLComputePipelineState> ps_layer = g_pipelines[@"transformer_layer_fused"];
-    if (!ps_layer) {
-        fprintf(stderr, "[glm-metal] native forward: layer kernel not found\n");
+    id<MTLComputePipelineState> ps_embed = g_pipelines[@"embed_dequant_q80"];
+    id<MTLComputePipelineState> ps_rms = g_pipelines[@"rmsnorm_f32"];
+    id<MTLComputePipelineState> ps_prepare_q = g_pipelines[@"prepare_q_head"];
+    id<MTLComputePipelineState> ps_rope_lut = g_pipelines[@"rope_inplace_lut"];
+    id<MTLComputePipelineState> ps_scores = g_pipelines[@"attention_scores"];
+    id<MTLComputePipelineState> ps_softmax = g_pipelines[@"softmax_1d"];
+    id<MTLComputePipelineState> ps_context = g_pipelines[@"attention_context"];
+    id<MTLComputePipelineState> ps_add = g_pipelines[@"vec_add_inplace"];
+    id<MTLComputePipelineState> ps_matvec = g_ps_matvec;
+    if (!ps_embed) {
+        fprintf(stderr, "[glm-metal] native forward: embed kernel not found\n");
         return -1;
     }
-    
+    if (!ps_rms || !ps_prepare_q || !ps_rope_lut || !ps_scores || !ps_softmax || !ps_context || !ps_add || !ps_matvec) {
+        fprintf(stderr, "[glm-metal] native forward: required staged kernels not available\n");
+        return -1;
+    }
+
     const RuntimeConfig *cfg = &rt->cfg;
     const int n_layers = cfg->n_layers;
-    const uint32_t dim = (uint32_t)cfg->dim;
-    const uint32_t hidden_dim = (uint32_t)cfg->hidden_dim;
-    const int cpu_ffn_enabled = metal_native_ffn_cpu_enabled();
+    const int dim = cfg->dim;
+    const int n_heads = cfg->n_heads;
+    const int q_lora = cfg->q_lora_rank;
+    const int kv_lora = cfg->kv_lora_rank;
+    const int rope_dim = cfg->rope_dim;
+    const int qk_nope = cfg->l0_qk_nope_dim;
+    const int head_k = cfg->l0_head_k_dim;
+    const int v_head = cfg->l0_v_head_dim;
+    const int att_concat_dim = n_heads * v_head;
+    const int gs = (int)cfg->group_size;
+    const int qk_groups = (qk_nope > 0 && gs > 0) ? (qk_nope / gs) : 0;
+    const int kv_groups = (kv_lora > 0 && gs > 0) ? (kv_lora / gs) : 0;
+    const float kq_scale = 1.0f / sqrtf((float)head_k);
+    if (dim <= 0 || n_heads <= 0 || q_lora <= 0 || kv_lora <= 0 || qk_nope <= 0 || head_k <= 0 || v_head <= 0 || gs <= 0) {
+        fprintf(stderr, "[glm-metal] native forward: invalid staged attention configuration\n");
+        return -1;
+    }
+    if (g_rope_half_dim > 0u && (!g_run.rope_cos || !g_run.rope_sin)) {
+        fprintf(stderr, "[glm-metal] native forward: missing rope lookup buffers\n");
+        return -1;
+    }
+
     const int parity_requested = metal_native_parity_enabled() && (pos == 0 || metal_native_parity_all_pos());
     const int parity_stage = metal_native_parity_stage();
+    int cpu_ffn_enabled = metal_native_ffn_cpu_enabled();
+    if (parity_requested && (parity_stage == GLM_NATIVE_PARITY_STAGE_FFN || parity_stage == GLM_NATIVE_PARITY_STAGE_BOTH)) {
+        cpu_ffn_enabled = 1;
+    }
     float *cpu_layer_ckpt = NULL;
     float *cpu_attn_ckpt = NULL;
     int cpu_layers_written = 0;
@@ -982,26 +1172,7 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
     int parity_layers = 0;
     int parity_failed = 0;
     float parity_tol = metal_native_parity_tol();
-    
-    // Create argument buffer for layer args
-    struct LayerArgs {
-        uint32_t dim;
-        uint32_t hidden_dim;
-        uint32_t n_heads;
-        uint32_t q_lora_rank;
-        uint32_t kv_lora_rank;
-        uint32_t rope_dim;
-        uint32_t qk_nope_dim;
-        uint32_t v_head_dim;
-        uint32_t head_k_dim;
-        uint32_t seq_len;
-        uint32_t pos;
-        uint32_t layer_idx;
-        float kq_scale;
-        uint32_t gs;
-    };
-    
-    // Allocate intermediate buffers for each layer (ping-pong buffers: x <-> x_out)
+
     id<MTLBuffer> buf_x = g_run.x;
     id<MTLBuffer> buf_x_out = g_run.xb;
 
@@ -1075,6 +1246,7 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
 
     int per_layer_sync = cpu_ffn_enabled || (cpu_layer_ckpt != NULL) || (cpu_attn_ckpt != NULL);
     id<MTLCommandBuffer> cb = nil;
+    id<MTLComputeCommandEncoder> fast_encoder = nil;
     if (!per_layer_sync) {
         cb = [g_queue commandBuffer];
         if (!cb) {
@@ -1084,130 +1256,300 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
             free(gpu_attn_snapshot);
             return -1;
         }
+        fast_encoder = [cb computeCommandEncoder];
+        if (!fast_encoder) {
+            fprintf(stderr, "[glm-metal] native forward: failed to create fast-path encoder\n");
+            free(cpu_layer_ckpt);
+            free(cpu_attn_ckpt);
+            free(gpu_attn_snapshot);
+            return -1;
+        }
     }
-    
-    // Step 1: Token embedding lookup (GPU)
-    // For now, do this on CPU and copy to GPU
-    // TODO: Implement GPU embed lookup kernel
-    int gs = (int)cfg->group_size;
-    int n_groups = cfg->dim / gs;
-    const int8_t *eq = rt->tok_q + (size_t)token * (size_t)cfg->dim;
-    const float *es = rt->tok_s + (size_t)token * (size_t)n_groups;
-    // Dequantize on CPU for now
-    float *x_host = (float *)malloc(cfg->dim * sizeof(float));
-    for (int i = 0; i < cfg->dim; i++) {
-        int group = i / gs;
-        x_host[i] = (float)eq[i] * es[group];
+
+    // Step 1: Token embedding lookup
+    if (per_layer_sync) {
+        int n_groups = cfg->dim / gs;
+        const int8_t *eq = rt->tok_q + (size_t)token * (size_t)cfg->dim;
+        const float *es = rt->tok_s + (size_t)token * (size_t)n_groups;
+        float *x_host = (float *)g_run.x.contents;
+        for (int i = 0; i < cfg->dim; i++) {
+            int group = i / gs;
+            x_host[i] = (float)eq[i] * es[group];
+        }
+    } else {
+        struct {
+            uint32_t token;
+            uint32_t dim;
+            uint32_t gs;
+        } embed_args = {(uint32_t)token, (uint32_t)cfg->dim, (uint32_t)gs};
+        const unsigned int emb_tgs = 256u;
+        const unsigned int emb_tgx = ((unsigned int)cfg->dim + emb_tgs - 1u) / emb_tgs;
+        [fast_encoder setComputePipelineState:ps_embed];
+        [fast_encoder setBytes:&embed_args length:sizeof(embed_args) atIndex:0];
+        [fast_encoder setBuffer:g_model.tok_q offset:0 atIndex:1];
+        [fast_encoder setBuffer:g_model.tok_s offset:0 atIndex:2];
+        [fast_encoder setBuffer:g_run.x offset:0 atIndex:3];
+        [fast_encoder dispatchThreadgroups:MTLSizeMake(emb_tgx, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(emb_tgs, 1, 1)];
     }
-    memcpy(g_run.x.contents, x_host, cfg->dim * sizeof(float));
-    free(x_host);
 
     // Step 2: Process all layers
     for (int layer = 0; layer < n_layers; layer++) {
-        id<MTLCommandBuffer> cb_layer = cb ? cb : [g_queue commandBuffer];
-        if (!cb_layer) {
-            fprintf(stderr, "[glm-metal] native forward: failed to create layer command buffer\n");
-            free(cpu_layer_ckpt);
-            return -1;
+        id<MTLCommandBuffer> cb_layer = cb;
+        id<MTLComputeCommandEncoder> encoder = fast_encoder;
+        if (per_layer_sync) {
+            cb_layer = [g_queue commandBuffer];
+            if (!cb_layer) {
+                fprintf(stderr, "[glm-metal] native forward: failed to create layer command buffer\n");
+                free(cpu_layer_ckpt);
+                free(cpu_attn_ckpt);
+                free(gpu_attn_snapshot);
+                return -1;
+            }
+            encoder = [cb_layer computeCommandEncoder];
+            if (!encoder) {
+                fprintf(stderr, "[glm-metal] native forward: failed to create layer encoder\n");
+                free(cpu_layer_ckpt);
+                free(cpu_attn_ckpt);
+                free(gpu_attn_snapshot);
+                return -1;
+            }
         }
-        id<MTLComputeCommandEncoder> encoder = [cb_layer computeCommandEncoder];
-        if (!encoder) {
-            fprintf(stderr, "[glm-metal] native forward: failed to create layer encoder\n");
-            free(cpu_layer_ckpt);
-            return -1;
-        }
-        
-        // Set up layer arguments
-        id<MTLBuffer> args_buf = [g_device newBufferWithLength:sizeof(struct LayerArgs) options:MTLResourceStorageModeShared];
-        struct LayerArgs *args = (struct LayerArgs *)args_buf.contents;
-        args->dim = dim;
-        args->hidden_dim = hidden_dim;
-        args->n_heads = (uint32_t)cfg->n_heads;
-        args->q_lora_rank = (uint32_t)cfg->q_lora_rank;
-        args->kv_lora_rank = (uint32_t)cfg->kv_lora_rank;
-        args->rope_dim = (uint32_t)cfg->rope_dim;
-        args->qk_nope_dim = (uint32_t)cfg->l0_qk_nope_dim;
-        args->v_head_dim = (uint32_t)cfg->l0_v_head_dim;
-        args->head_k_dim = (uint32_t)cfg->l0_head_k_dim;
-        args->seq_len = (uint32_t)st->cache_cap;
-        args->pos = (uint32_t)pos;
-        args->layer_idx = (uint32_t)layer;
-        args->kq_scale = 1.0f / sqrtf((float)cfg->l0_head_k_dim);
-        args->gs = (uint32_t)gs;
-        
+
         MetalLayerBuffers *lb = &g_layers[layer];
-        
-        // Set pipeline
-        [encoder setComputePipelineState:ps_layer];
-        
-        // Set buffers - attention weights
-        [encoder setBuffer:args_buf offset:0 atIndex:0];
-        [encoder setBuffer:lb->attn_norm offset:0 atIndex:1];
-        [encoder setBuffer:lb->q_a_norm offset:0 atIndex:2];
-        [encoder setBuffer:lb->kv_a_norm offset:0 atIndex:3];
-        [encoder setBuffer:lb->q_a_q offset:0 atIndex:4];
-        [encoder setBuffer:lb->q_a_s offset:0 atIndex:5];
-        [encoder setBuffer:lb->q_b_q offset:0 atIndex:6];
-        [encoder setBuffer:lb->q_b_s offset:0 atIndex:7];
-        [encoder setBuffer:lb->kv_a_q offset:0 atIndex:8];
-        [encoder setBuffer:lb->kv_a_s offset:0 atIndex:9];
-        [encoder setBuffer:lb->k_b_q offset:0 atIndex:10];
-        [encoder setBuffer:lb->k_b_s offset:0 atIndex:11];
-        [encoder setBuffer:lb->v_b_q offset:0 atIndex:12];
-        [encoder setBuffer:lb->v_b_s offset:0 atIndex:13];
-        [encoder setBuffer:lb->attn_out_q offset:0 atIndex:14];
-        [encoder setBuffer:lb->attn_out_s offset:0 atIndex:15];
-        
-        // FFN weights
-        if (layer == 0 && rt->has_l0_ffn) {
-            [encoder setBuffer:g_model.l0_ffn_norm offset:0 atIndex:16];
-            [encoder setBuffer:g_model.l0_ffn_gate_q offset:0 atIndex:17];
-            [encoder setBuffer:g_model.l0_ffn_gate_s offset:0 atIndex:18];
-            [encoder setBuffer:g_model.l0_ffn_up_q offset:0 atIndex:19];
-            [encoder setBuffer:g_model.l0_ffn_up_s offset:0 atIndex:20];
-            [encoder setBuffer:g_model.l0_ffn_down_q offset:0 atIndex:21];
-            [encoder setBuffer:g_model.l0_ffn_down_s offset:0 atIndex:22];
-        } else if (rt->has_moe_shared && layer > 0) {
-            [encoder setBuffer:lb->ffn_norm offset:0 atIndex:16];
-            [encoder setBuffer:lb->gate_sh_q offset:0 atIndex:17];
-            [encoder setBuffer:lb->gate_sh_s offset:0 atIndex:18];
-            [encoder setBuffer:lb->up_sh_q offset:0 atIndex:19];
-            [encoder setBuffer:lb->up_sh_s offset:0 atIndex:20];
-            [encoder setBuffer:lb->down_sh_q offset:0 atIndex:21];
-            [encoder setBuffer:lb->down_sh_s offset:0 atIndex:22];
-        } else {
-            // No FFN for this layer - set dummy buffers
-            [encoder setBuffer:g_run.x offset:0 atIndex:16];
-            [encoder setBuffer:g_run.x offset:0 atIndex:17];
-            [encoder setBuffer:g_run.x offset:0 atIndex:18];
-            [encoder setBuffer:g_run.x offset:0 atIndex:19];
-            [encoder setBuffer:g_run.x offset:0 atIndex:20];
-            [encoder setBuffer:g_run.x offset:0 atIndex:21];
-            [encoder setBuffer:g_run.x offset:0 atIndex:22];
-        }
-        
-        // Activations - use ping-pong buffers
+
         id<MTLBuffer> input_buf = (layer % 2 == 0) ? buf_x : buf_x_out;
         id<MTLBuffer> output_buf = (layer % 2 == 0) ? buf_x_out : buf_x;
-        
-        [encoder setBuffer:input_buf offset:0 atIndex:23];
-        [encoder setBuffer:output_buf offset:0 atIndex:24];
-        [encoder setBuffer:g_run.k_cache_comp offset:0 atIndex:25];
-        [encoder setBuffer:g_run.k_cache_pe offset:0 atIndex:26];
-        
-        // Intermediate buffers
-        [encoder setBuffer:g_run.layer_intermediates offset:0 atIndex:27];
-        [encoder setBuffer:g_run.layer_ff_intermediates offset:0 atIndex:28];
-        
-        // Dispatch
-        // Fused kernel currently requires single-threadgroup execution because
-        // it uses threadgroup barriers across phase boundaries.
-        const unsigned int tgs = 256;
-        const unsigned int tgx = 1;
-        [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
-        [encoder endEncoding];
 
-        if (cb == nil) {
+        MetalVecArgs rms_args = {(uint32_t)dim};
+        {
+            void *buffers[] = {(__bridge void *)input_buf, (__bridge void *)lb->attn_norm, (__bridge void *)g_run.xn};
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)dim + tgs - 1u) / tgs;
+            dispatch(encoder, "rmsnorm_f32", tgx, tgs, &rms_args, sizeof(rms_args), buffers, 3);
+        }
+
+        dispatch_matvec_simdgroup(encoder,
+                                  ps_matvec,
+                                  (MetalMatvecArgs){(uint32_t)q_lora, (uint32_t)dim, (uint32_t)gs},
+                                  lb->q_a_q,
+                                  0,
+                                  lb->q_a_s,
+                                  0,
+                                  g_run.xn,
+                                  0,
+                                  g_run.q_a,
+                                  0);
+
+        {
+            MetalVecArgs q_norm = {(uint32_t)q_lora};
+            void *buffers[] = {(__bridge void *)g_run.q_a, (__bridge void *)lb->q_a_norm, (__bridge void *)g_run.q_a};
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)q_lora + tgs - 1u) / tgs;
+            dispatch(encoder, "rmsnorm_f32", tgx, tgs, &q_norm, sizeof(q_norm), buffers, 3);
+        }
+
+        dispatch_matvec_simdgroup(encoder,
+                                  ps_matvec,
+                                  (MetalMatvecArgs){(uint32_t)(n_heads * head_k), (uint32_t)q_lora, (uint32_t)gs},
+                                  lb->q_b_q,
+                                  0,
+                                  lb->q_b_s,
+                                  0,
+                                  g_run.q_a,
+                                  0,
+                                  g_run.q_full,
+                                  0);
+
+        dispatch_matvec_simdgroup(encoder,
+                                  ps_matvec,
+                                  (MetalMatvecArgs){(uint32_t)(kv_lora + rope_dim), (uint32_t)dim, (uint32_t)gs},
+                                  lb->kv_a_q,
+                                  0,
+                                  lb->kv_a_s,
+                                  0,
+                                  g_run.xn,
+                                  0,
+                                  g_run.kv_a,
+                                  0);
+
+        {
+            MetalVecArgs kv_norm = {(uint32_t)kv_lora};
+            void *buffers[] = {(__bridge void *)g_run.kv_a, (__bridge void *)lb->kv_a_norm, (__bridge void *)g_run.kv_a};
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)kv_lora + tgs - 1u) / tgs;
+            dispatch(encoder, "rmsnorm_f32", tgx, tgs, &kv_norm, sizeof(kv_norm), buffers, 3);
+        }
+
+        if (rope_dim > 1 && g_rope_half_dim > 0u) {
+            MetalRopeLutArgs rope_args = {(uint32_t)rope_dim, (uint32_t)pos, g_rope_half_dim};
+            [encoder setComputePipelineState:ps_rope_lut];
+            [encoder setBytes:&rope_args length:sizeof(rope_args) atIndex:0];
+            [encoder setBuffer:g_run.kv_a offset:(NSUInteger)kv_lora * sizeof(float) atIndex:1];
+            [encoder setBuffer:g_run.rope_cos offset:0 atIndex:2];
+            [encoder setBuffer:g_run.rope_sin offset:0 atIndex:3];
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = (g_rope_half_dim + tgs - 1u) / tgs;
+            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        }
+
+        {
+            size_t comp_base = (size_t)layer * (size_t)st->cache_cap * (size_t)kv_lora + (size_t)pos * (size_t)kv_lora;
+            MetalCacheWriteArgs w = {(uint32_t)comp_base, (uint32_t)kv_lora};
+            void *buffers[] = {(__bridge void *)g_run.kv_a, (__bridge void *)g_run.k_cache_comp};
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)kv_lora + tgs - 1u) / tgs;
+            dispatch(encoder, "cache_write_kv_comp", tgx, tgs, &w, sizeof(w), buffers, 2);
+        }
+
+        if (rope_dim > 0) {
+            size_t pe_base = (size_t)layer * (size_t)st->cache_cap * (size_t)rope_dim + (size_t)pos * (size_t)rope_dim;
+            MetalCacheWriteArgs w = {(uint32_t)pe_base, (uint32_t)rope_dim};
+            [encoder setComputePipelineState:g_pipelines[@"cache_write_kv_pe"]];
+            [encoder setBytes:&w length:sizeof(w) atIndex:0];
+            [encoder setBuffer:g_run.kv_a offset:(NSUInteger)kv_lora * sizeof(float) atIndex:1];
+            [encoder setBuffer:g_run.k_cache_pe offset:0 atIndex:2];
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)rope_dim + tgs - 1u) / tgs;
+            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        }
+
+        NSUInteger layer_comp_off = (NSUInteger)((size_t)layer * (size_t)st->cache_cap * (size_t)kv_lora * sizeof(float));
+        NSUInteger layer_pe_off = (NSUInteger)((size_t)layer * (size_t)st->cache_cap * (size_t)rope_dim * sizeof(float));
+
+        for (int h = 0; h < n_heads; h++) {
+            MetalHeadSliceArgs prep = {
+                (uint32_t)qk_nope,
+                (uint32_t)rope_dim,
+                (uint32_t)head_k,
+                (uint32_t)h,
+                (uint32_t)pos,
+                g_rope_half_dim,
+            };
+            unsigned int prep_n = (unsigned int)qk_nope;
+            if (g_rope_half_dim > prep_n) prep_n = g_rope_half_dim;
+            if (prep_n > 0u) {
+                [encoder setComputePipelineState:ps_prepare_q];
+                [encoder setBytes:&prep length:sizeof(prep) atIndex:0];
+                [encoder setBuffer:g_run.q_full offset:0 atIndex:1];
+                [encoder setBuffer:g_run.rope_cos offset:0 atIndex:2];
+                [encoder setBuffer:g_run.rope_sin offset:0 atIndex:3];
+                [encoder setBuffer:g_run.q_nope offset:0 atIndex:4];
+                [encoder setBuffer:g_run.q_pe offset:0 atIndex:5];
+                const unsigned int tgs = 256u;
+                const unsigned int tgx = (prep_n + tgs - 1u) / tgs;
+                [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+            }
+
+            NSUInteger kq_off = (NSUInteger)((size_t)h * (size_t)kv_lora * (size_t)qk_nope * sizeof(int8_t));
+            NSUInteger ks_off = (NSUInteger)((size_t)h * (size_t)kv_lora * (size_t)qk_groups * sizeof(float));
+            dispatch_matvec_simdgroup(encoder,
+                                      ps_matvec,
+                                      (MetalMatvecArgs){(uint32_t)kv_lora, (uint32_t)qk_nope, (uint32_t)gs},
+                                      lb->k_b_q,
+                                      kq_off,
+                                      lb->k_b_s,
+                                      ks_off,
+                                      g_run.q_nope,
+                                      0,
+                                      g_run.q_abs,
+                                      0);
+
+            struct {
+                uint32_t kv_lora_rank;
+                uint32_t rope_dim;
+                uint32_t pos;
+                float kq_scale;
+            } score_args = {(uint32_t)kv_lora, (uint32_t)rope_dim, (uint32_t)pos, kq_scale};
+
+            [encoder setComputePipelineState:ps_scores];
+            [encoder setBytes:&score_args length:sizeof(score_args) atIndex:0];
+            [encoder setBuffer:g_run.q_abs offset:0 atIndex:1];
+            [encoder setBuffer:g_run.q_pe offset:0 atIndex:2];
+            [encoder setBuffer:g_run.k_cache_comp offset:layer_comp_off atIndex:3];
+            [encoder setBuffer:g_run.k_cache_pe offset:layer_pe_off atIndex:4];
+            [encoder setBuffer:g_run.att_scores offset:0 atIndex:5];
+            {
+                const unsigned int tgs = 256u;
+                const unsigned int tgx = ((unsigned int)(pos + 1) + tgs - 1u) / tgs;
+                [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+            }
+
+            {
+                struct {
+                    uint32_t n;
+                } softmax_args = {(uint32_t)(pos + 1)};
+                [encoder setComputePipelineState:ps_softmax];
+                [encoder setBytes:&softmax_args length:sizeof(softmax_args) atIndex:0];
+                [encoder setBuffer:g_run.att_scores offset:0 atIndex:1];
+                [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            }
+
+            {
+                struct {
+                    uint32_t kv_lora_rank;
+                    uint32_t pos;
+                } ctx_args = {(uint32_t)kv_lora, (uint32_t)pos};
+                [encoder setComputePipelineState:ps_context];
+                [encoder setBytes:&ctx_args length:sizeof(ctx_args) atIndex:0];
+                [encoder setBuffer:g_run.att_scores offset:0 atIndex:1];
+                [encoder setBuffer:g_run.k_cache_comp offset:layer_comp_off atIndex:2];
+                [encoder setBuffer:g_run.att_ctx offset:0 atIndex:3];
+                const unsigned int tgs = 256u;
+                const unsigned int tgx = ((unsigned int)kv_lora + tgs - 1u) / tgs;
+                [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+            }
+
+            NSUInteger vq_off = (NSUInteger)((size_t)h * (size_t)v_head * (size_t)kv_lora * sizeof(int8_t));
+            NSUInteger vs_off = (NSUInteger)((size_t)h * (size_t)v_head * (size_t)kv_groups * sizeof(float));
+            NSUInteger out_off = (NSUInteger)((size_t)h * (size_t)v_head * sizeof(float));
+            dispatch_matvec_simdgroup(encoder,
+                                      ps_matvec,
+                                      (MetalMatvecArgs){(uint32_t)v_head, (uint32_t)kv_lora, (uint32_t)gs},
+                                      lb->v_b_q,
+                                      vq_off,
+                                      lb->v_b_s,
+                                      vs_off,
+                                      g_run.att_ctx,
+                                      0,
+                                      g_run.att_concat,
+                                      out_off);
+        }
+
+        dispatch_matvec_simdgroup(encoder,
+                                  ps_matvec,
+                                  (MetalMatvecArgs){(uint32_t)dim, (uint32_t)att_concat_dim, (uint32_t)gs},
+                                  lb->attn_out_q,
+                                  0,
+                                  lb->attn_out_s,
+                                  0,
+                                  g_run.att_concat,
+                                  0,
+                                  output_buf,
+                                  0);
+
+        {
+            struct {
+                uint32_t n;
+            } add_args = {(uint32_t)dim};
+            [encoder setComputePipelineState:ps_add];
+            [encoder setBytes:&add_args length:sizeof(add_args) atIndex:0];
+            [encoder setBuffer:output_buf offset:0 atIndex:1];
+            [encoder setBuffer:input_buf offset:0 atIndex:2];
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)dim + tgs - 1u) / tgs;
+            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        }
+
+        if (per_layer_sync) {
+            [encoder endEncoding];
             [cb_layer commit];
             [cb_layer waitUntilCompleted];
             if (cb_layer.error) {
@@ -1270,12 +1612,40 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
         }
     }
 
-    // Step 3: Final RMSNorm + LM head (TODO: implement GPU kernel)
-    // For now, read output back to CPU and do final steps there.
+    // Step 3: Final RMSNorm + LM head
     id<MTLBuffer> final_output = (n_layers % 2 == 0) ? buf_x : buf_x_out;
 
-    // Step 4: Read back to CPU for final processing.
-    if (cb != nil) {
+    if (!per_layer_sync) {
+        if (!ps_rms || !ps_matvec) {
+            [fast_encoder endEncoding];
+            free(cpu_layer_ckpt);
+            free(cpu_attn_ckpt);
+            free(gpu_attn_snapshot);
+            fprintf(stderr, "[glm-metal] native forward: missing final kernels\n");
+            return -1;
+        }
+
+        MetalVecArgs rms_args = {(uint32_t)cfg->dim};
+        {
+            void *buffers[] = {(__bridge void *)final_output, (__bridge void *)g_model.output_norm, (__bridge void *)g_run.xn};
+            const unsigned int tgs = 256u;
+            const unsigned int tgx = ((unsigned int)cfg->dim + tgs - 1u) / tgs;
+            dispatch(fast_encoder, "rmsnorm_f32", tgx, tgs, &rms_args, sizeof(rms_args), buffers, 3);
+        }
+
+        dispatch_matvec_simdgroup(fast_encoder,
+                                  ps_matvec,
+                                  (MetalMatvecArgs){(uint32_t)cfg->vocab_size, (uint32_t)cfg->dim, (uint32_t)gs},
+                                  g_model.out_q,
+                                  0,
+                                  g_model.out_s,
+                                  0,
+                                  g_run.xn,
+                                  0,
+                                  g_run.logits,
+                                  0);
+        [fast_encoder endEncoding];
+
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.error) {
@@ -1285,14 +1655,13 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
             free(gpu_attn_snapshot);
             return -1;
         }
+        memcpy(st->logits, g_run.logits.contents, (size_t)cfg->vocab_size * sizeof(float));
+    } else {
+        // Per-layer sync mode: final head on CPU for easier parity instrumentation.
+        memcpy(st->x, final_output.contents, cfg->dim * sizeof(float));
+        rmsnorm_cpu(st->xn, st->x, rt->output_norm, cfg->dim);
+        matvec_q80_cpu(rt->out_q, rt->out_s, st->xn, st->logits, cfg->vocab_size, cfg->dim, gs);
     }
-
-    // Final processing on CPU for now (RMSNorm + LM head)
-    memcpy(st->x, final_output.contents, cfg->dim * sizeof(float));
-
-    // Do final steps on CPU
-    rmsnorm_cpu(st->xn, st->x, rt->output_norm, cfg->dim);
-    matvec_q80_cpu(rt->out_q, rt->out_s, st->xn, st->logits, cfg->vocab_size, cfg->dim, gs);
 
     free(cpu_layer_ckpt);
     free(cpu_attn_ckpt);
@@ -1336,7 +1705,7 @@ int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos,
         } else {
             int strict_mode = metal_native_strict();
             int run_native_this_pos = (!parity_mode || parity_this_pos);
-            int need_backup = run_native_this_pos && ((!strict_mode) || parity_this_pos);
+            int need_backup = run_native_this_pos && (parity_this_pos || metal_native_backup_enabled());
 
             if (need_backup) {
                 if (runstate_backup_from(rt, st, &backup_state) == 0) {
@@ -1416,16 +1785,16 @@ int glm_metal_matvec_rows(const int8_t *qmat, const float *smat, const float *x,
     args[1] = (uint32_t)dim;
     args[2] = (uint32_t)gs;
 
-    // Use SIMD-group cooperative reduction: 32 threads (1 simdgroup) per row
-    const unsigned int simd_size = 32;
-    const unsigned int tgx = (unsigned int)rows;  // One threadgroup per row
+    const unsigned int tgs = matvec_simdgroup_tgs(g_ps_matvec);
+    const unsigned int rows_per_tg = matvec_rows_per_threadgroup(g_ps_matvec, tgs);
+    const unsigned int tgx = ((unsigned int)rows + rows_per_tg - 1u) / rows_per_tg;
     static const NSUInteger offsets[4] = {0, 0, 0, 0};
     id<MTLBuffer> mtl_buffers[4] = {q_buf, s_buf, x_buf, y_buf};
     [encoder setComputePipelineState:g_ps_matvec];
     [encoder setBuffer:g_matvec_args offset:0 atIndex:0];
     [encoder setBuffers:mtl_buffers offsets:offsets withRange:NSMakeRange(1, 4)];
-    [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1) 
-              threadsPerThreadgroup:MTLSizeMake(simd_size, 1, 1)];
+    [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
     [encoder endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -1639,15 +2008,15 @@ int glm_metal_microbench(const Runtime *rt, const char *kernel_family, int iters
             args[0] = mat_rows;
             args[1] = mat_dim;
             args[2] = mat_gs;
-            // simdgroup variant: one row per simdgroup (32 threads)
-            const unsigned int simd_size = 32;
-            const unsigned int tgx = mat_rows;
+            const unsigned int tgs = matvec_simdgroup_tgs(ps0);
+            const unsigned int rows_per_tg = matvec_rows_per_threadgroup(ps0, tgs);
+            const unsigned int tgx = (mat_rows + rows_per_tg - 1u) / rows_per_tg;
             static const NSUInteger offsets[4] = {0, 0, 0, 0};
             id<MTLBuffer> mtl_buffers[4] = {b1, b2, b3, b4};
             [encoder setComputePipelineState:ps0];
             [encoder setBuffer:g_matvec_args offset:0 atIndex:0];
             [encoder setBuffers:mtl_buffers offsets:offsets withRange:NSMakeRange(1, 4)];
-            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1) threadsPerThreadgroup:MTLSizeMake(simd_size, 1, 1)];
+            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
         } else if (strcmp(kernel_family, "rmsnorm_f32") == 0) {
             struct {
                 uint32_t n;
@@ -1756,6 +2125,7 @@ void glm_metal_free(void) {
     
     g_run = (MetalRunStateBuffers){0};
     g_model = (MetalModelBuffers){0};
+    g_rope_half_dim = 0;
     g_matvec_args = nil;
     g_ps_matvec = nil;
     g_nocopy_cache = nil;

@@ -1,0 +1,110 @@
+[glm-metal] initialized device=Apple M4 native=on native_unsafe=on native_ffn_cpu=off native_backup=off hybrid_matvec=off
+[glm-metal] uploaded 47 layers to GPU
+[glm-metal] prepared GPU buffers for native forward
+[glm-metal] native parity: enabled for pos=0 ffn_layers=47 attn_layers=47 stage=2 tol=0.001
+[glm-metal] native parity: comparing both post-attn and post-ffn checkpoints
+[glm-metal-parity] stage=attn layer=0 l1=4.334637e-06 linf=1.490116e-08 idx=1178 gpu=-0.069887 cpu=-0.069887
+[glm-metal-parity] stage=ffn layer=0 l1=5.903130e-06 linf=5.960464e-08 idx=1492 gpu=0.353030 cpu=0.353030
+[glm-metal-parity] stage=attn layer=1 l1=9.264790e-06 linf=2.980232e-08 idx=1492 gpu=0.277014 cpu=0.277015
+[glm-metal-parity] stage=ffn layer=1 l1=1.777653e-05 linf=4.470348e-08 idx=1190 gpu=0.042197 cpu=0.042197
+[glm-metal-parity] stage=attn layer=2 l1=2.085397e-05 linf=5.960464e-08 idx=1492 gpu=0.523398 cpu=0.523398
+[glm-metal-parity] stage=ffn layer=2 l1=1.716786e-04 linf=7.152557e-07 idx=42 gpu=1.559499 cpu=1.559498
+[glm-metal-parity] stage=attn layer=3 l1=1.714636e-04 linf=7.152557e-07 idx=42 gpu=1.562685 cpu=1.562684
+[glm-metal-parity] stage=ffn layer=3 l1=1.948117e-04 linf=9.536743e-07 idx=42 gpu=2.116975 cpu=2.116974
+[glm-metal-parity] stage=attn layer=4 l1=1.954479e-04 linf=9.536743e-07 idx=42 gpu=2.122857 cpu=2.122856
+[glm-metal-parity] stage=ffn layer=4 l1=1.946476e-04 linf=9.536743e-07 idx=42 gpu=2.119734 cpu=2.119733
+[glm-metal-parity] stage=attn layer=5 l1=1.956068e-04 linf=9.536743e-07 idx=42 gpu=2.113708 cpu=2.113708
+[glm-metal-parity] stage=ffn layer=5 l1=2.024295e-04 linf=9.536743e-07 idx=42 gpu=1.934717 cpu=1.934716
+[glm-metal-parity] stage=attn layer=6 l1=2.023117e-04 linf=9.536743e-07 idx=42 gpu=1.921340 cpu=1.921339
+[glm-metal-parity] stage=ffn layer=6 l1=2.227034e-04 linf=1.192093e-06 idx=42 gpu=2.126868 cpu=2.126867
+[glm-metal-parity] stage=attn layer=7 l1=2.229658e-04 linf=1.192093e-06 idx=42 gpu=2.119302 cpu=2.119301
+[glm-metal-parity] stage=ffn layer=7 l1=1.886329e-04 linf=1.072884e-06 idx=42 gpu=1.789546 cpu=1.789545
+[glm-metal-parity] stage=attn layer=8 l1=1.883475e-04 linf=1.072884e-06 idx=42 gpu=1.759560 cpu=1.759559
+[glm-metal-parity] stage=ffn layer=8 l1=1.850040e-04 linf=9.536743e-07 idx=42 gpu=1.306545 cpu=1.306545
+[glm-metal-parity] stage=attn layer=9 l1=1.842489e-04 linf=9.536743e-07 idx=42 gpu=1.282691 cpu=1.282690
+[glm-metal-parity] stage=ffn layer=9 l1=8.039642e-04 linf=3.337860e-06 idx=1492 gpu=-2.589269 cpu=-2.589265
+[glm-metal-parity] stage=attn layer=10 l1=7.976324e-04 linf=3.099442e-06 idx=1492 gpu=-2.926692 cpu=-2.926689
+[glm-metal-parity] stage=ffn layer=10 l1=2.085591e-03 linf=6.198883e-06 idx=1492 gpu=-6.559632 cpu=-6.559626
+[glm-metal-parity] stage=attn layer=11 l1=2.084572e-03 linf=6.198883e-06 idx=1492 gpu=-6.558508 cpu=-6.558502
+[glm-metal-parity] stage=ffn layer=11 l1=1.790918e-03 linf=4.768372e-06 idx=850 gpu=10.160095 cpu=10.160090
+[glm-metal-parity] stage=attn layer=12 l1=1.794316e-03 linf=4.768372e-06 idx=850 gpu=10.172279 cpu=10.172275
+[glm-metal-parity] stage=ffn layer=12 l1=2.660368e-03 linf=7.629395e-06 idx=850 gpu=15.960054 cpu=15.960047
+[glm-metal-parity] stage=attn layer=13 l1=2.657474e-03 linf=7.629395e-06 idx=850 gpu=16.000540 cpu=16.000532
+[glm-metal-parity] stage=ffn layer=13 l1=3.720507e-03 linf=1.144409e-05 idx=850 gpu=28.627312 cpu=28.627300
+[glm-metal-parity] stage=attn layer=14 l1=3.719387e-03 linf=1.144409e-05 idx=850 gpu=28.645285 cpu=28.645273
+[glm-metal-parity] stage=ffn layer=14 l1=3.596026e-03 linf=1.144409e-05 idx=850 gpu=31.932842 cpu=31.932831
+[glm-metal-parity] stage=attn layer=15 l1=3.593327e-03 linf=1.144409e-05 idx=850 gpu=31.946787 cpu=31.946775
+[glm-metal-parity] stage=ffn layer=15 l1=3.808256e-03 linf=1.525879e-05 idx=850 gpu=38.959370 cpu=38.959354
+[glm-metal-parity] stage=attn layer=16 l1=3.810409e-03 linf=1.525879e-05 idx=850 gpu=38.959503 cpu=38.959488
+[glm-metal-parity] stage=ffn layer=16 l1=4.098542e-03 linf=1.907349e-05 idx=850 gpu=46.463593 cpu=46.463573
+[glm-metal-parity] stage=attn layer=17 l1=4.106120e-03 linf=1.907349e-05 idx=850 gpu=46.450577 cpu=46.450558
+[glm-metal-parity] stage=ffn layer=17 l1=4.098229e-03 linf=1.907349e-05 idx=850 gpu=48.945915 cpu=48.945896
+[glm-metal-parity] stage=attn layer=18 l1=4.102156e-03 linf=1.907349e-05 idx=850 gpu=48.947151 cpu=48.947132
+[glm-metal-parity] stage=ffn layer=18 l1=4.139207e-03 linf=1.907349e-05 idx=850 gpu=53.657818 cpu=53.657799
+[glm-metal-parity] stage=attn layer=19 l1=4.129402e-03 linf=1.907349e-05 idx=850 gpu=53.631176 cpu=53.631157
+[glm-metal-parity] stage=ffn layer=19 l1=4.149742e-03 linf=1.907349e-05 idx=850 gpu=54.193737 cpu=54.193718
+[glm-metal-parity] stage=attn layer=20 l1=4.155094e-03 linf=1.907349e-05 idx=850 gpu=54.199677 cpu=54.199657
+[glm-metal-parity] stage=ffn layer=20 l1=4.204452e-03 linf=1.907349e-05 idx=850 gpu=55.112267 cpu=55.112247
+[glm-metal-parity] stage=attn layer=21 l1=4.226387e-03 linf=1.907349e-05 idx=850 gpu=55.046764 cpu=55.046745
+[glm-metal-parity] stage=ffn layer=21 l1=4.250040e-03 linf=1.907349e-05 idx=850 gpu=55.913399 cpu=55.913380
+[glm-metal-parity] stage=attn layer=22 l1=4.249733e-03 linf=1.907349e-05 idx=850 gpu=55.893902 cpu=55.893883
+[glm-metal-parity] stage=ffn layer=22 l1=4.202247e-03 linf=1.525879e-05 idx=850 gpu=59.964409 cpu=59.964394
+[glm-metal-parity] stage=attn layer=23 l1=4.208285e-03 linf=1.525879e-05 idx=850 gpu=59.925797 cpu=59.925781
+[glm-metal-parity] stage=ffn layer=23 l1=4.313409e-03 linf=1.525879e-05 idx=766 gpu=47.520493 cpu=47.520477
+[glm-metal-parity] stage=attn layer=24 l1=4.332967e-03 linf=1.525879e-05 idx=766 gpu=47.545261 cpu=47.545246
+[glm-metal-parity] stage=ffn layer=24 l1=4.362872e-03 linf=1.525879e-05 idx=766 gpu=48.315395 cpu=48.315380
+[glm-metal-parity] stage=attn layer=25 l1=4.370298e-03 linf=1.525879e-05 idx=766 gpu=48.327557 cpu=48.327541
+[glm-metal-parity] stage=ffn layer=25 l1=4.413102e-03 linf=1.525879e-05 idx=766 gpu=52.218876 cpu=52.218861
+[glm-metal-parity] stage=attn layer=26 l1=4.443129e-03 linf=1.525879e-05 idx=766 gpu=52.251480 cpu=52.251465
+[glm-metal-parity] stage=ffn layer=26 l1=4.472751e-03 linf=1.525879e-05 idx=766 gpu=55.924065 cpu=55.924049
+[glm-metal-parity] stage=attn layer=27 l1=4.470237e-03 linf=1.525879e-05 idx=766 gpu=55.958824 cpu=55.958809
+[glm-metal-parity] stage=ffn layer=27 l1=4.642725e-03 linf=1.525879e-05 idx=766 gpu=59.065014 cpu=59.064999
+[glm-metal-parity] stage=attn layer=28 l1=4.665732e-03 linf=1.525879e-05 idx=766 gpu=59.075787 cpu=59.075771
+[glm-metal-parity] stage=ffn layer=28 l1=4.703023e-03 linf=1.525879e-05 idx=766 gpu=59.839512 cpu=59.839497
+[glm-metal-parity] stage=attn layer=29 l1=4.703784e-03 linf=1.525879e-05 idx=766 gpu=59.873535 cpu=59.873520
+[glm-metal-parity] stage=ffn layer=29 l1=4.746705e-03 linf=1.525879e-05 idx=766 gpu=63.060905 cpu=63.060890
+[glm-metal-parity] stage=attn layer=30 l1=4.753726e-03 linf=1.525879e-05 idx=766 gpu=63.090099 cpu=63.090084
+[glm-metal-parity] stage=ffn layer=30 l1=4.853010e-03 linf=1.525879e-05 idx=766 gpu=64.773285 cpu=64.773270
+[glm-metal-parity] stage=attn layer=31 l1=4.866078e-03 linf=1.525879e-05 idx=766 gpu=64.767082 cpu=64.767067
+[glm-metal-parity] stage=ffn layer=31 l1=4.888080e-03 linf=1.525879e-05 idx=339 gpu=-39.459610 cpu=-39.459625
+[glm-metal-parity] stage=attn layer=32 l1=4.888750e-03 linf=1.525879e-05 idx=339 gpu=-39.475170 cpu=-39.475185
+[glm-metal-parity] stage=ffn layer=32 l1=4.893526e-03 linf=1.525879e-05 idx=339 gpu=-40.550663 cpu=-40.550678
+[glm-metal-parity] stage=attn layer=33 l1=4.920183e-03 linf=1.525879e-05 idx=339 gpu=-40.569950 cpu=-40.569965
+[glm-metal-parity] stage=ffn layer=33 l1=4.946858e-03 linf=1.525879e-05 idx=339 gpu=-40.952011 cpu=-40.952026
+[glm-metal-parity] stage=attn layer=34 l1=4.966892e-03 linf=1.525879e-05 idx=339 gpu=-40.931736 cpu=-40.931751
+[glm-metal-parity] stage=ffn layer=34 l1=4.976366e-03 linf=1.525879e-05 idx=339 gpu=-40.964352 cpu=-40.964367
+[glm-metal-parity] stage=attn layer=35 l1=4.986934e-03 linf=1.525879e-05 idx=339 gpu=-40.907280 cpu=-40.907295
+[glm-metal-parity] stage=ffn layer=35 l1=5.034909e-03 linf=1.525879e-05 idx=339 gpu=-41.766148 cpu=-41.766163
+[glm-metal-parity] stage=attn layer=36 l1=5.042907e-03 linf=1.525879e-05 idx=339 gpu=-41.793018 cpu=-41.793034
+[glm-metal-parity] stage=ffn layer=36 l1=5.038992e-03 linf=1.525879e-05 idx=339 gpu=-42.315544 cpu=-42.315559
+[glm-metal-parity] stage=attn layer=37 l1=5.042873e-03 linf=1.525879e-05 idx=339 gpu=-42.260784 cpu=-42.260799
+[glm-metal-parity] stage=ffn layer=37 l1=5.057359e-03 linf=1.525879e-05 idx=339 gpu=-42.656624 cpu=-42.656639
+[glm-metal-parity] stage=attn layer=38 l1=5.054967e-03 linf=1.525879e-05 idx=339 gpu=-42.670544 cpu=-42.670559
+[glm-metal-parity] stage=ffn layer=38 l1=4.896354e-03 linf=1.525879e-05 idx=339 gpu=-40.089596 cpu=-40.089611
+[glm-metal-parity] stage=attn layer=39 l1=4.898970e-03 linf=1.525879e-05 idx=339 gpu=-40.050079 cpu=-40.050095
+[glm-metal-parity] stage=ffn layer=39 l1=1.185161e-02 linf=4.196167e-05 idx=749 gpu=57.144245 cpu=57.144203
+[glm-metal-parity] stage=attn layer=40 l1=1.185855e-02 linf=4.196167e-05 idx=749 gpu=57.169914 cpu=57.169872
+[glm-metal-parity] stage=ffn layer=40 l1=1.726139e-02 linf=6.103516e-05 idx=270 gpu=124.274956 cpu=124.274895
+[glm-metal-parity] stage=attn layer=41 l1=1.725885e-02 linf=6.103516e-05 idx=270 gpu=124.209648 cpu=124.209587
+[glm-metal-parity] stage=ffn layer=41 l1=1.712931e-02 linf=6.103516e-05 idx=270 gpu=125.515137 cpu=125.515076
+[glm-metal-parity] stage=attn layer=42 l1=1.714524e-02 linf=6.103516e-05 idx=270 gpu=125.530525 cpu=125.530464
+[glm-metal-parity] stage=ffn layer=42 l1=1.649656e-02 linf=5.340576e-05 idx=749 gpu=75.534462 cpu=75.534409
+[glm-metal-parity] stage=attn layer=43 l1=1.650114e-02 linf=4.577637e-05 idx=179 gpu=-88.440651 cpu=-88.440605
+[glm-metal-parity] stage=ffn layer=43 l1=1.619861e-02 linf=6.103516e-05 idx=270 gpu=143.095337 cpu=143.095276
+[glm-metal-parity] stage=attn layer=44 l1=1.622514e-02 linf=7.629395e-05 idx=270 gpu=142.827454 cpu=142.827377
+[glm-metal-parity] stage=ffn layer=44 l1=1.631504e-02 linf=7.629395e-05 idx=270 gpu=140.445023 cpu=140.444946
+[glm-metal-parity] stage=attn layer=45 l1=1.632183e-02 linf=7.629395e-05 idx=270 gpu=140.538406 cpu=140.538330
+[glm-metal-parity] stage=ffn layer=45 l1=1.691559e-02 linf=9.155273e-05 idx=270 gpu=151.512497 cpu=151.512405
+[glm-metal-parity] stage=attn layer=46 l1=1.694817e-02 linf=9.155273e-05 idx=270 gpu=151.586777 cpu=151.586685
+[glm-metal-parity] stage=ffn layer=46 l1=1.914835e-02 linf=9.155273e-05 idx=132 gpu=352.886414 cpu=352.886322
+[glm-metal] native parity probe complete; executing CPU reference path
+[glm-metal] using OMP threads=4 for CPU-compatible path
+[glm4.7-flash] loaded checkpoint
+  dim=2048 layers=47 heads=20 kv_heads=1 vocab=154880 seq_len=202752
+  mode=completion version=4
+  forward=embed+mla_attn_all+l0_dense_ffn+moe_shared_ffn+moe_routed+final_norm+lm_head
+  blocks: l0_attn=on all_attn=on l0_ffn=on moe_shared=on moe_routed=on native_coverage=partial
+  attn_layers_active=47
+  backend=metal
+1+1=
+2

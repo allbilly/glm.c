@@ -18,6 +18,21 @@ struct RopeArgs {
     uint pos;
 };
 
+struct RopeLutArgs {
+    uint dim;
+    uint pos;
+    uint half_dim;
+};
+
+struct HeadSliceArgs {
+    uint qk_nope_dim;
+    uint rope_dim;
+    uint head_k_dim;
+    uint head_idx;
+    uint pos;
+    uint rope_half_dim;
+};
+
 struct SoftmaxArgs {
     uint n;
 };
@@ -106,8 +121,8 @@ kernel void matvec_q80_rows(
     y[row] = acc;
 }
 
-// SIMD-group cooperative matvec: one row processed cooperatively by a simdgroup
-// Threadgroup must be sized as multiples of 32 (simdgroup size on Apple GPUs)
+// SIMD-group cooperative matvec: one row per simdgroup.
+// Threadgroup may contain multiple simdgroups to amortize dispatch overhead.
 kernel void matvec_q80_rows_simdgroup(
     constant MatvecArgs &args [[buffer(0)]],
     device const char *qmat [[buffer(1)]],
@@ -115,13 +130,15 @@ kernel void matvec_q80_rows_simdgroup(
     device const float *x [[buffer(3)]],
     device float *y [[buffer(4)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_size [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simdgroup_id [[simdgroup_index_in_threadgroup]]
 ) {
-    (void)simdgroup_id;
-    uint row = tg_pos.x;
-    if (row >= args.rows) return;
     const uint simd_size = 32;
+    uint rows_per_tg = tg_size.x / simd_size;
+    if (rows_per_tg == 0u) rows_per_tg = 1u;
+    uint row = tg_pos.x * rows_per_tg + simdgroup_id;
+    if (row >= args.rows) return;
     uint groups = args.dim / args.gs;
     uint qoff = row * args.dim;
     uint soff = row * groups;
@@ -163,6 +180,53 @@ kernel void rope_inplace(
     float x1 = x[i + 1];
     x[i + 0] = x0 * c - x1 * s;
     x[i + 1] = x0 * s + x1 * c;
+}
+
+kernel void rope_inplace_lut(
+    constant RopeLutArgs &args [[buffer(0)]],
+    device float *x [[buffer(1)]],
+    device const float *rope_cos [[buffer(2)]],
+    device const float *rope_sin [[buffer(3)]],
+    uint pair_idx [[thread_position_in_grid]]
+) {
+    if (pair_idx >= args.half_dim) return;
+    uint i = pair_idx * 2u;
+    if (i + 1u >= args.dim) return;
+    uint lut_idx = args.pos * args.half_dim + pair_idx;
+    float c = rope_cos[lut_idx];
+    float s = rope_sin[lut_idx];
+    float x0 = x[i + 0u];
+    float x1 = x[i + 1u];
+    x[i + 0u] = x0 * c - x1 * s;
+    x[i + 1u] = x0 * s + x1 * c;
+}
+
+kernel void prepare_q_head(
+    constant HeadSliceArgs &args [[buffer(0)]],
+    device const float *q_full [[buffer(1)]],
+    device const float *rope_cos [[buffer(2)]],
+    device const float *rope_sin [[buffer(3)]],
+    device float *q_nope [[buffer(4)]],
+    device float *q_pe [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    uint base = args.head_idx * args.head_k_dim;
+    if (i < args.qk_nope_dim) {
+        q_nope[i] = q_full[base + i];
+    }
+    if (i < args.rope_half_dim) {
+        uint src = base + args.qk_nope_dim + i * 2u;
+        uint dst = i * 2u;
+        if (dst + 1u < args.rope_dim) {
+            uint lut_idx = args.pos * args.rope_half_dim + i;
+            float c = rope_cos[lut_idx];
+            float s = rope_sin[lut_idx];
+            float x0 = q_full[src + 0u];
+            float x1 = q_full[src + 1u];
+            q_pe[dst + 0u] = x0 * c - x1 * s;
+            q_pe[dst + 1u] = x0 * s + x1 * c;
+        }
+    }
 }
 
 kernel void softmax_1d(
