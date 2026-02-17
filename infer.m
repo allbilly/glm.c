@@ -24,9 +24,7 @@ static id<MTLComputePipelineState> g_ps_matvec = nil;
 static id<MTLBuffer> g_matvec_args = nil;
 
 static int g_cfg_native = -1;
-static int g_cfg_hybrid_matvec = -1;
 static int g_cfg_native_strict = -1;
-static int g_cfg_native_unsafe = -1;
 static int g_cfg_native_backup = -1;
 static int g_cfg_native_parity = -1;
 static int g_cfg_native_parity_all_pos = -1;
@@ -34,8 +32,8 @@ static int g_cfg_native_parity_layers = -1;
 static int g_cfg_native_parity_stage = -2;
 static float g_cfg_native_parity_tol = -1.0f;
 static int g_cfg_native_layer_tgs = -1;
+static int g_cfg_hybrid_matvec = -1;
 static int g_cfg_matvec_simd_tgs = -1;
-static int g_warned_native_requires_unsafe = 0;
 static int g_omp_tuned = 0;
 
 // Persistent command buffer for batching matvec operations
@@ -122,11 +120,7 @@ static unsigned int matvec_rows_per_threadgroup(id<MTLComputePipelineState> ps, 
 }
 
 static int metal_native_enabled(void) {
-    return env_flag_cached("GLM_METAL_NATIVE", &g_cfg_native, 0);
-}
-
-static int metal_hybrid_matvec_enabled(void) {
-    return env_flag_cached("GLM_METAL_HYBRID_MATVEC", &g_cfg_hybrid_matvec, 0);
+    return env_flag_cached("GLM_METAL_NATIVE", &g_cfg_native, 1);
 }
 
 static int metal_native_strict(void) {
@@ -134,11 +128,15 @@ static int metal_native_strict(void) {
 }
 
 static int metal_native_unsafe_enabled(void) {
-    return env_flag_cached("GLM_METAL_NATIVE_UNSAFE", &g_cfg_native_unsafe, 0);
+    return env_flag_cached("GLM_METAL_NATIVE_UNSAFE", &g_cfg_native, 1);
 }
 
 static int metal_native_backup_enabled(void) {
     return env_flag_cached("GLM_METAL_NATIVE_BACKUP", &g_cfg_native_backup, 0);
+}
+
+static int metal_hybrid_matvec_enabled(void) {
+    return env_flag_cached("GLM_METAL_HYBRID_MATVEC", &g_cfg_hybrid_matvec, 0);
 }
 
 static int metal_native_parity_enabled(void) {
@@ -1671,412 +1669,50 @@ int glm_metal_forward_token(const Runtime *rt, RunState *st, int token, int pos,
     int parity_this_pos = parity_mode && (pos == 0 || metal_native_parity_all_pos());
 
     if (metal_native_enabled()) {
-        if (!metal_native_unsafe_enabled()) {
-            if (!g_warned_native_requires_unsafe) {
-                fprintf(stderr,
-                        "[glm-metal] GLM_METAL_NATIVE is set, but native kernels are experimental; "
-                        "set GLM_METAL_NATIVE_UNSAFE=1 to execute them\n");
-                g_warned_native_requires_unsafe = 1;
+        int strict_mode = metal_native_strict();
+        int run_native_this_pos = (!parity_mode || parity_this_pos);
+        int need_backup = run_native_this_pos && (parity_this_pos || metal_native_backup_enabled());
+
+        if (need_backup) {
+            if (runstate_backup_from(rt, st, &backup_state) == 0) {
+                backup_ready = 1;
+            } else {
+                fprintf(stderr, "[glm-metal] native fallback backup failed; disabling fallback for this token\n");
             }
-        } else {
-            int strict_mode = metal_native_strict();
-            int run_native_this_pos = (!parity_mode || parity_this_pos);
-            int need_backup = run_native_this_pos && (parity_this_pos || metal_native_backup_enabled());
+        }
 
-            if (need_backup) {
-                if (runstate_backup_from(rt, st, &backup_state) == 0) {
-                    backup_ready = 1;
-                } else {
-                    fprintf(stderr, "[glm-metal] native fallback backup failed; disabling fallback for this token\n");
-                }
+        if (run_native_this_pos) {
+            int st_native = glm_metal_forward_token_native(rt, st, token, pos, debug_mode);
+            if (st_native == 0 && !parity_this_pos) {
+                if (backup_ready) runstate_backup_free(&backup_state);
+                return 0;
             }
 
-            if (run_native_this_pos) {
-                int st_native = glm_metal_forward_token_native(rt, st, token, pos, debug_mode);
-                if (st_native == 0 && !parity_this_pos) {
-                    if (backup_ready) runstate_backup_free(&backup_state);
-                    return 0;
-                }
+            if (strict_mode && st_native != 0) {
+                if (backup_ready) runstate_backup_free(&backup_state);
+                fprintf(stderr, "[glm-metal] native strict mode enabled; aborting on native failure\n");
+                return st_native;
+            }
 
-                if (strict_mode && st_native != 0) {
-                    if (backup_ready) runstate_backup_free(&backup_state);
-                    fprintf(stderr, "[glm-metal] native strict mode enabled; aborting on native failure\n");
-                    return st_native;
-                }
+            if (!backup_ready) {
+                fprintf(stderr, "[glm-metal] native path needs fallback restore but no backup exists\n");
+                return st_native != 0 ? st_native : -1;
+            }
 
-                if (!backup_ready) {
-                    fprintf(stderr, "[glm-metal] native path needs fallback restore but no backup exists\n");
-                    return st_native != 0 ? st_native : -1;
-                }
+            runstate_restore_from_backup(rt, &backup_state, st);
+            runstate_backup_free(&backup_state);
 
-                runstate_restore_from_backup(rt, &backup_state, st);
-                runstate_backup_free(&backup_state);
-
-                if (parity_this_pos && st_native == 0) {
-                    fprintf(stderr, "[glm-metal] native parity probe complete; executing CPU reference path\n");
-                } else {
-                    fprintf(stderr, "[glm-metal] native forward failed, falling back to CPU-compatible path\n");
-                }
+            if (parity_this_pos && st_native == 0) {
+                fprintf(stderr, "[glm-metal] native parity probe complete; executing CPU reference path\n");
+            } else {
+                fprintf(stderr, "[glm-metal] native forward failed, falling back to CPU-compatible path\n");
             }
         }
     }
 
-    int prev_mode = glm_backend_metal_matvec_enabled();
     metal_tune_omp_if_needed();
-    if (metal_hybrid_matvec_enabled()) {
-        glm_set_metal_matvec_mode(1);
-    }
     int status = glm_cpu_forward_token(rt, st, token, pos, debug_mode);
-    if (!prev_mode) {
-        glm_set_metal_matvec_mode(0);
-    }
     return status;
-}
-
-int glm_metal_matvec_rows(const int8_t *qmat, const float *smat, const float *x, float *y, int rows, int dim, int gs) {
-    if (!g_device || !g_queue) return -1;
-    if (!qmat || !smat || !x || !y) return -1;
-    if (rows <= 0 || dim <= 0 || gs <= 0 || (dim % gs) != 0) return -1;
-
-    const NSUInteger q_bytes = (NSUInteger)rows * (NSUInteger)dim * sizeof(int8_t);
-    const NSUInteger s_bytes = (NSUInteger)rows * (NSUInteger)(dim / gs) * sizeof(float);
-    const NSUInteger x_bytes = (NSUInteger)dim * sizeof(float);
-    const NSUInteger y_bytes = (NSUInteger)rows * sizeof(float);
-
-    id<MTLBuffer> q_buf = cached_nocopy_buffer(qmat, q_bytes, "qmat");
-    id<MTLBuffer> s_buf = cached_nocopy_buffer(smat, s_bytes, "smat");
-    id<MTLBuffer> x_buf = cached_nocopy_buffer(x, x_bytes, "x");
-    id<MTLBuffer> y_buf = cached_nocopy_buffer(y, y_bytes, "y");
-
-    if (!q_buf || !s_buf || !x_buf || !y_buf) return -1;
-    if (!g_ps_matvec || !g_matvec_args) return -1;
-
-    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    if (!cb) return -1;
-    id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
-    if (!encoder) return -1;
-
-    uint32_t *args = (uint32_t *)g_matvec_args.contents;
-    args[0] = (uint32_t)rows;
-    args[1] = (uint32_t)dim;
-    args[2] = (uint32_t)gs;
-
-    const unsigned int tgs = matvec_simdgroup_tgs(g_ps_matvec);
-    const unsigned int rows_per_tg = matvec_rows_per_threadgroup(g_ps_matvec, tgs);
-    const unsigned int tgx = ((unsigned int)rows + rows_per_tg - 1u) / rows_per_tg;
-    static const NSUInteger offsets[4] = {0, 0, 0, 0};
-    id<MTLBuffer> mtl_buffers[4] = {q_buf, s_buf, x_buf, y_buf};
-    [encoder setComputePipelineState:g_ps_matvec];
-    [encoder setBuffer:g_matvec_args offset:0 atIndex:0];
-    [encoder setBuffers:mtl_buffers offsets:offsets withRange:NSMakeRange(1, 4)];
-    [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
-    [encoder endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.error) {
-        fprintf(stderr, "[glm-metal] matvec command failed: %s\n", cb.error.localizedDescription.UTF8String);
-        return -1;
-    }
-    return 0;
-}
-
-int glm_metal_microbench(const Runtime *rt, const char *kernel_family, int iters, int warmup) {
-    if (!g_device || !g_queue || !g_pipelines || !rt || !kernel_family) return -1;
-    if (iters <= 0) iters = 64;
-    if (warmup < 0) warmup = 0;
-
-    double *samples = (double *)calloc((size_t)iters, sizeof(double));
-    double *sorted = (double *)calloc((size_t)iters, sizeof(double));
-    if (!samples || !sorted) {
-        free(samples);
-        free(sorted);
-        return -1;
-    }
-
-    id<MTLComputePipelineState> ps0 = nil;
-    id<MTLComputePipelineState> ps1 = nil;
-    id<MTLComputePipelineState> ps2 = nil;
-    NSUInteger active_bytes = 0;
-
-    uint32_t mat_rows = 0, mat_dim = 0, mat_gs = 0;
-    uint32_t vec_n = 0;
-    uint32_t rope_dim = 0, rope_pos = 127;
-    uint32_t att_kv = 0, att_rope = 0, att_pos = 0;
-    float att_scale = 1.0f;
-
-    id<MTLBuffer> b1 = nil;
-    id<MTLBuffer> b2 = nil;
-    id<MTLBuffer> b3 = nil;
-    id<MTLBuffer> b4 = nil;
-    id<MTLBuffer> b5 = nil;
-    id<MTLBuffer> b6 = nil;
-
-    if (strcmp(kernel_family, "matvec_q80_rows") == 0 || strcmp(kernel_family, "matvec_q80_rows_simdgroup") == 0) {
-        mat_rows = (uint32_t)rt->cfg.hidden_dim;
-        if (mat_rows < 64u) mat_rows = 64u;
-        if (mat_rows > 4096u) mat_rows = 4096u;
-        mat_dim = (uint32_t)rt->cfg.dim;
-        mat_gs = (uint32_t)rt->cfg.group_size;
-        if (mat_dim == 0 || mat_gs == 0 || (mat_dim % mat_gs) != 0) {
-            fprintf(stderr, "[glm-kbench] invalid matvec shape (rows=%u dim=%u gs=%u)\n", mat_rows, mat_dim, mat_gs);
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-
-        NSUInteger q_bytes = (NSUInteger)mat_rows * (NSUInteger)mat_dim * sizeof(int8_t);
-        NSUInteger s_bytes = (NSUInteger)mat_rows * (NSUInteger)(mat_dim / mat_gs) * sizeof(float);
-        NSUInteger x_bytes = (NSUInteger)mat_dim * sizeof(float);
-        NSUInteger y_bytes = (NSUInteger)mat_rows * sizeof(float);
-        b1 = make_shared_buffer(q_bytes, "kbench_q");
-        b2 = make_shared_buffer(s_bytes, "kbench_s");
-        b3 = make_shared_buffer(x_bytes, "kbench_x");
-        b4 = make_shared_buffer(y_bytes, "kbench_y");
-        if (!b1 || !b2 || !b3 || !b4) {
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-        memset(b1.contents, 1, q_bytes);
-        float *s = (float *)b2.contents;
-        for (NSUInteger i = 0; i < s_bytes / sizeof(float); i++) s[i] = 0.01f;
-        float *x = (float *)b3.contents;
-        for (NSUInteger i = 0; i < x_bytes / sizeof(float); i++) x[i] = 1.0f;
-
-        if (strcmp(kernel_family, "matvec_q80_rows_simdgroup") == 0) {
-            ps0 = g_pipelines[@"matvec_q80_rows_simdgroup"];
-        } else {
-            ps0 = g_ps_matvec;
-        }
-        active_bytes = q_bytes + s_bytes + x_bytes + y_bytes;
-    } else if (strcmp(kernel_family, "rmsnorm_f32") == 0) {
-        vec_n = (uint32_t)rt->cfg.dim;
-        if (vec_n == 0) vec_n = 1024;
-        NSUInteger bytes = (NSUInteger)vec_n * sizeof(float);
-        b1 = make_shared_buffer(bytes, "kbench_x");
-        b2 = make_shared_buffer(bytes, "kbench_w");
-        b3 = make_shared_buffer(bytes, "kbench_y");
-        if (!b1 || !b2 || !b3) {
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-        float *x = (float *)b1.contents;
-        float *w = (float *)b2.contents;
-        for (NSUInteger i = 0; i < bytes / sizeof(float); i++) {
-            x[i] = 1.0f;
-            w[i] = 1.0f;
-        }
-        ps0 = g_pipelines[@"rmsnorm_f32"];
-        active_bytes = bytes * 3u;
-    } else if (strcmp(kernel_family, "rope_inplace") == 0) {
-        rope_dim = rt->cfg.rope_dim > 0 ? (uint32_t)rt->cfg.rope_dim : (uint32_t)rt->cfg.dim;
-        if (rope_dim < 2u) rope_dim = 2u;
-        if ((rope_dim & 1u) != 0u) rope_dim--;
-        NSUInteger bytes = (NSUInteger)rope_dim * sizeof(float);
-        b1 = make_shared_buffer(bytes, "kbench_rope_x");
-        if (!b1) {
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-        float *x = (float *)b1.contents;
-        for (NSUInteger i = 0; i < bytes / sizeof(float); i++) x[i] = (float)(i % 17) * 0.125f;
-        ps0 = g_pipelines[@"rope_inplace"];
-        active_bytes = bytes * 2u;
-    } else if (strcmp(kernel_family, "attention_scores_context") == 0) {
-        att_kv = (uint32_t)rt->cfg.kv_lora_rank;
-        att_rope = (uint32_t)rt->cfg.rope_dim;
-        if (att_kv == 0 || att_rope == 0) {
-            fprintf(stderr, "[glm-kbench] attention kernels require kv_lora_rank and rope_dim\n");
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-        att_pos = 255u;
-        if ((uint32_t)rt->cfg.seq_len > 0 && att_pos + 1u > (uint32_t)rt->cfg.seq_len) {
-            att_pos = (uint32_t)rt->cfg.seq_len - 1u;
-        }
-        if (att_pos < 1u) att_pos = 1u;
-        uint32_t tlen = att_pos + 1u;
-        uint32_t head_k = (uint32_t)rt->cfg.l0_head_k_dim;
-        if (head_k == 0) head_k = att_kv + att_rope;
-        att_scale = 1.0f / sqrtf((float)head_k);
-
-        NSUInteger q_abs_bytes = (NSUInteger)att_kv * sizeof(float);
-        NSUInteger q_pe_bytes = (NSUInteger)att_rope * sizeof(float);
-        NSUInteger k_comp_bytes = (NSUInteger)tlen * (NSUInteger)att_kv * sizeof(float);
-        NSUInteger k_pe_bytes = (NSUInteger)tlen * (NSUInteger)att_rope * sizeof(float);
-        NSUInteger scores_bytes = (NSUInteger)tlen * sizeof(float);
-        NSUInteger ctx_bytes = (NSUInteger)att_kv * sizeof(float);
-
-        b1 = make_shared_buffer(q_abs_bytes, "kbench_q_abs");
-        b2 = make_shared_buffer(q_pe_bytes, "kbench_q_pe");
-        b3 = make_shared_buffer(k_comp_bytes, "kbench_k_comp");
-        b4 = make_shared_buffer(k_pe_bytes, "kbench_k_pe");
-        b5 = make_shared_buffer(scores_bytes, "kbench_scores");
-        b6 = make_shared_buffer(ctx_bytes, "kbench_ctx");
-        if (!b1 || !b2 || !b3 || !b4 || !b5 || !b6) {
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-
-        float *q_abs = (float *)b1.contents;
-        for (NSUInteger i = 0; i < q_abs_bytes / sizeof(float); i++) q_abs[i] = 0.25f;
-        float *q_pe = (float *)b2.contents;
-        for (NSUInteger i = 0; i < q_pe_bytes / sizeof(float); i++) q_pe[i] = 0.125f;
-        float *k_comp = (float *)b3.contents;
-        for (NSUInteger i = 0; i < k_comp_bytes / sizeof(float); i++) k_comp[i] = 0.03125f;
-        float *k_pe = (float *)b4.contents;
-        for (NSUInteger i = 0; i < k_pe_bytes / sizeof(float); i++) k_pe[i] = 0.015625f;
-
-        ps0 = g_pipelines[@"attention_scores"];
-        ps1 = g_pipelines[@"softmax_1d"];
-        ps2 = g_pipelines[@"attention_context"];
-        active_bytes = q_abs_bytes + q_pe_bytes + (k_comp_bytes * 2u) + k_pe_bytes + (scores_bytes * 2u) + ctx_bytes;
-    } else {
-        fprintf(stderr, "[glm-kbench] unknown kernel family: %s\n", kernel_family);
-        free(samples);
-        free(sorted);
-        return -1;
-    }
-
-    if (!ps0) {
-        fprintf(stderr, "[glm-kbench] missing pipeline for %s\n", kernel_family);
-        free(samples);
-        free(sorted);
-        return -1;
-    }
-
-    const int total = warmup + iters;
-    for (int i = 0; i < total; i++) {
-        double t0 = monotonic_ms();
-        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-        if (!cb) {
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-        id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
-        if (!encoder) {
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-
-        if (strcmp(kernel_family, "matvec_q80_rows") == 0) {
-            uint32_t *args = (uint32_t *)g_matvec_args.contents;
-            args[0] = mat_rows;
-            args[1] = mat_dim;
-            args[2] = mat_gs;
-            const unsigned int tgs = 128;
-            const unsigned int tgx = (mat_rows + tgs - 1u) / tgs;
-            static const NSUInteger offsets[4] = {0, 0, 0, 0};
-            id<MTLBuffer> mtl_buffers[4] = {b1, b2, b3, b4};
-            [encoder setComputePipelineState:ps0];
-            [encoder setBuffer:g_matvec_args offset:0 atIndex:0];
-            [encoder setBuffers:mtl_buffers offsets:offsets withRange:NSMakeRange(1, 4)];
-            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
-        } else if (strcmp(kernel_family, "matvec_q80_rows_simdgroup") == 0) {
-            uint32_t *args = (uint32_t *)g_matvec_args.contents;
-            args[0] = mat_rows;
-            args[1] = mat_dim;
-            args[2] = mat_gs;
-            const unsigned int tgs = matvec_simdgroup_tgs(ps0);
-            const unsigned int rows_per_tg = matvec_rows_per_threadgroup(ps0, tgs);
-            const unsigned int tgx = (mat_rows + rows_per_tg - 1u) / rows_per_tg;
-            static const NSUInteger offsets[4] = {0, 0, 0, 0};
-            id<MTLBuffer> mtl_buffers[4] = {b1, b2, b3, b4};
-            [encoder setComputePipelineState:ps0];
-            [encoder setBuffer:g_matvec_args offset:0 atIndex:0];
-            [encoder setBuffers:mtl_buffers offsets:offsets withRange:NSMakeRange(1, 4)];
-            [encoder dispatchThreadgroups:MTLSizeMake(tgx, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
-        } else if (strcmp(kernel_family, "rmsnorm_f32") == 0) {
-            struct {
-                uint32_t n;
-            } args = {vec_n};
-            const unsigned int tgs = 256;
-            const unsigned int tgx = (vec_n + tgs - 1u) / tgs;
-            void *buffers[] = {(__bridge void *)b1, (__bridge void *)b2, (__bridge void *)b3};
-            dispatch(encoder, "rmsnorm_f32", tgx, tgs, &args, sizeof(args), buffers, 3);
-        } else if (strcmp(kernel_family, "rope_inplace") == 0) {
-            struct {
-                uint32_t dim;
-                uint32_t pos;
-            } args = {rope_dim, rope_pos};
-            const unsigned int tgs = 256;
-            const unsigned int tgx = (rope_dim + tgs - 1u) / tgs;
-            void *buffers[] = {(__bridge void *)b1};
-            dispatch(encoder, "rope_inplace", tgx, tgs, &args, sizeof(args), buffers, 1);
-        } else {
-            struct {
-                uint32_t kv_lora_rank;
-                uint32_t rope_dim;
-                uint32_t pos;
-                float kq_scale;
-            } score_args = {att_kv, att_rope, att_pos, att_scale};
-            struct {
-                uint32_t n;
-            } softmax_args = {att_pos + 1u};
-            struct {
-                uint32_t kv_lora_rank;
-                uint32_t pos;
-            } ctx_args = {att_kv, att_pos};
-
-            void *score_buffers[] = {
-                (__bridge void *)b1,
-                (__bridge void *)b2,
-                (__bridge void *)b3,
-                (__bridge void *)b4,
-                (__bridge void *)b5,
-            };
-            const unsigned int score_tgs = 128;
-            const unsigned int score_tgx = (att_pos + 1u + score_tgs - 1u) / score_tgs;
-            dispatch(encoder, "attention_scores", score_tgx, score_tgs, &score_args, sizeof(score_args), score_buffers, 5);
-
-            void *softmax_buffers[] = {(__bridge void *)b5};
-            dispatch(encoder, "softmax_1d", 1, 1, &softmax_args, sizeof(softmax_args), softmax_buffers, 1);
-
-            void *ctx_buffers[] = {(__bridge void *)b5, (__bridge void *)b3, (__bridge void *)b6};
-            const unsigned int ctx_tgs = 128;
-            const unsigned int ctx_tgx = (att_kv + ctx_tgs - 1u) / ctx_tgs;
-            dispatch(encoder, "attention_context", ctx_tgx, ctx_tgs, &ctx_args, sizeof(ctx_args), ctx_buffers, 3);
-        }
-
-        [encoder endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-        if (cb.error) {
-            fprintf(stderr, "[glm-kbench] command failed: %s\n", cb.error.localizedDescription.UTF8String);
-            free(samples);
-            free(sorted);
-            return -1;
-        }
-
-        double elapsed = monotonic_ms() - t0;
-        if (i >= warmup) samples[i - warmup] = elapsed;
-    }
-
-    double total_ms = 0.0;
-    for (int i = 0; i < iters; i++) {
-        total_ms += samples[i];
-        sorted[i] = samples[i];
-    }
-    qsort(sorted, (size_t)iters, sizeof(double), cmp_double_asc);
-    double avg_ms = total_ms / (double)iters;
-    double p50 = percentile(sorted, iters, 50.0);
-    double p95 = percentile(sorted, iters, 95.0);
-    double bw_gbps = (avg_ms > 0.0) ? ((double)active_bytes / (avg_ms / 1000.0) / 1e9) : 0.0;
-
-    fprintf(stderr,
-            "[glm-kbench] kernel=%s iters=%d warmup=%d avg_ms=%.4f p50_ms=%.4f p95_ms=%.4f active_bytes=%lu est_bw_gbps=%.3f\n",
-            kernel_family, iters, warmup, avg_ms, p50, p95, (unsigned long)active_bytes, bw_gbps);
-
-    free(samples);
-    free(sorted);
-    return 0;
 }
 
 void glm_metal_free(void) {

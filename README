@@ -1,10 +1,26 @@
+./glm4.7-flash model/GLM-4.7-Flash.bin --backend metal -n 100 -i "i am batman"
+
 ### Latest sample results (Apple M4)
 
-| Mode | Tokens | tok/s | Notes |
-| --- | ---: | ---: | --- |
-| glm.c CPU (OMP=8) | 16 | **6.014** | `make bench-tps` sample |
-| glm.c Metal (default path) | 16 | **5.283** | CPU fallback path |
-| glm.c Metal native-fast (first token) | 2 | **9.346** | `make bench-native-fast-matrix` |
-| glm.c Metal native-fast (steady est) | 4 | **9.279** | tail estimate (`BENCH_NATIVE_STEADY_TOKENS=4`) |
-| llama.cpp CPU | 16 | **7.846** | +30% vs glm.c CPU |
-| llama.cpp Metal | 16 | **22.981** | +147% vs glm.c Metal native-fast |
+Benchmark methodology: 5 runs, average of runs 2-5 (excluding warmup), 100 tokens
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                      glm.c Performance Benchmarks (Apple M4)                        │
+├──────────────────────────────────────────┬──────────┬────────┬──────────────────────┤
+│ Mode                                     │  Tokens  │ tok/s  │       Notes          │
+├──────────────────────────────────────────┼──────────┼────────┼──────────────────────┤
+│ glm.c CPU (OMP=8)                        │   100    │  3.14  │ OMP=8, CPU-only      │
+├──────────────────────────────────────────┼──────────┼────────┼──────────────────────┤
+│ glm.c Metal (default path)               │   100    │  3.17  │ CPU fallback path    │
+│                                          │          │        │ [BASELINE]           │
+├──────────────────────────────────────────┼──────────┼────────┼──────────────────────┤
+│ >>> glm.c Metal Native GPU <<<           │   100    │  6.37  │ GLM_METAL_NATIVE=1   │
+│   ⭐ BEST OPTION                         │          │        │ Speedup: +101%       │
+├──────────────────────────────────────────┼──────────┼────────┼──────────────────────┤
+│ llama.cpp CPU                            │    16    │  7.846 │ +148% vs glm.c CPU   │
+├──────────────────────────────────────────┼──────────┼────────┼──────────────────────┤
+│ llama.cpp Metal                          │    16    │ 22.981 │ +624% vs glm.c CPU   │
+└──────────────────────────────────────────┴──────────┴────────┴──────────────────────┘
+
+Run benchmarks:
+  make bench-tps  # 5 runs, 100 tokens, avg of runs 2-5

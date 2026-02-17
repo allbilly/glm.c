@@ -82,7 +82,7 @@ LLAMA_COMPLETION ?= /opt/homebrew/bin/llama-completion
 LLAMA_BENCH ?= /opt/homebrew/bin/llama-bench
 EVAL_BACKEND ?= cpu
 EVAL_REF_NGL ?= 0
-BENCH_TOKENS ?= 16
+BENCH_TOKENS ?= 100
 BENCH_NATIVE_STEADY_TOKENS ?= 4
 BENCH_PROMPT ?= 1+1=
 BENCH_WARMUP ?= 1
@@ -314,40 +314,72 @@ bench-tps: build-metal tmp-dir
 	@set -e; \
 	tokens="$(BENCH_TOKENS)"; \
 	prompt="$(BENCH_PROMPT)"; \
-	glm_cpu_out=$(TMP_DIR)/glm_tps_glm-cpu.txt; \
-	glm_cpu_time=$(TMP_DIR)/glm_tps_glm-cpu.time.txt; \
-	glm_metal_out=$(TMP_DIR)/glm_tps_glm-metal.txt; \
-	glm_metal_time=$(TMP_DIR)/glm_tps_glm-metal.time.txt; \
-	llama_cpu_json=$(TMP_DIR)/glm_tps_llama-bench-cpu.json; \
-	llama_metal_json=$(TMP_DIR)/glm_tps_llama-bench-metal.json; \
-	if [ "$(BENCH_WARMUP)" = "1" ]; then \
-		echo "[bench] warmup glm.c cpu"; \
-		env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
-			./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
-		echo "[bench] warmup glm.c metal"; \
-		./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n 1 -t 0 --seed 0 -i "$$prompt" > /dev/null; \
-	fi; \
-	echo "[bench] glm.c cpu"; \
-	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
-		/usr/bin/time -p ./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$glm_cpu_out 2> $$glm_cpu_time; \
-	echo "[bench] glm.c metal"; \
-	/usr/bin/time -p ./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed 0 -i "$$prompt" > $$glm_metal_out 2> $$glm_metal_time; \
-	echo "[bench] llama.cpp cpu"; \
-	$(LLAMA_BENCH) -m "$(REF_MODEL)" -ngl 0 -p 1 -n $$tokens -r 1 -o json > $$llama_cpu_json; \
-	echo "[bench] llama.cpp metal"; \
-	$(LLAMA_BENCH) -m "$(REF_MODEL)" -ngl 99 -p 1 -n $$tokens -r 1 -o json > $$llama_metal_json; \
-	glm_cpu_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$glm_cpu_time); \
-	glm_metal_tps=$$(awk -v n=$$tokens '/^real /{if ($$2 > 0) printf "%.3f", n/$$2}' $$glm_metal_time); \
-	llama_cpu_tps=$$(F=$$llama_cpu_json python3 -c "import json, os; d=json.load(open(os.environ['F'])); g=next((x for x in d if x.get('n_gen', 0) > 0), None); print('%.3f' % g['avg_ts'] if g else 'nan')"); \
-	llama_metal_tps=$$(F=$$llama_metal_json python3 -c "import json, os; d=json.load(open(os.environ['F'])); g=next((x for x in d if x.get('n_gen', 0) > 0), None); print('%.3f' % g['avg_ts'] if g else 'nan')"); \
+	echo "========================================"; \
+	echo "TPS Benchmark - 5 runs, avg of runs 2-5"; \
+	echo "Tokens: $$tokens, Prompt: '$$prompt'"; \
+	echo "========================================"; \
 	echo ""; \
-	echo "TPS benchmark (tokens=$$tokens, prompt='$$prompt')"; \
+	glm_cpu_times=""; \
+	glm_metal_times=""; \
+	echo "[bench] glm.c cpu - 5 runs"; \
+	for i in 1 2 3 4 5; do \
+		echo -n "  Run $$i: "; \
+		time_file=$(TMP_DIR)/glm_tps_cpu_$$i.time; \
+		env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
+			/usr/bin/time -p ./glm4.7-flash "$(NATIVE_MODEL)" --backend cpu -n $$tokens -t 0 --seed $$i -i "$$prompt" > /dev/null 2> $$time_file; \
+		real_time=$$(awk '/^real /{print $$2}' $$time_file); \
+		echo "$${real_time}s"; \
+		glm_cpu_times="$$glm_cpu_times $$real_time"; \
+	done; \
+	echo "[bench] glm.c metal - 5 runs"; \
+	for i in 1 2 3 4 5; do \
+		echo -n "  Run $$i: "; \
+		time_file=$(TMP_DIR)/glm_tps_metal_$$i.time; \
+		/usr/bin/time -p ./glm4.7-flash "$(NATIVE_MODEL)" --backend metal -n $$tokens -t 0 --seed $$i -i "$$prompt" > /dev/null 2> $$time_file; \
+		real_time=$$(awk '/^real /{print $$2}' $$time_file); \
+		echo "$${real_time}s"; \
+		glm_metal_times="$$glm_metal_times $$real_time"; \
+	done; \
+	echo "[bench] llama.cpp cpu - 5 runs"; \
+	llama_cpu_times=""; \
+	for i in 1 2 3 4 5; do \
+		echo -n "  Run $$i: "; \
+		json_file=$(TMP_DIR)/llama_cpu_$$i.json; \
+		$(LLAMA_BENCH) -m "$(REF_MODEL)" -ngl 0 -p 1 -n $$tokens -r 1 -o json > $$json_file 2>/dev/null; \
+		tps=$$(python3 -c "import json; d=json.load(open('$$json_file')); g=next((x for x in d if x.get('n_gen', 0) > 0), None); print('%.3f' % g['avg_ts'] if g else '0')"); \
+		time=$$(python3 -c "import json; d=json.load(open('$$json_file')); g=next((x for x in d if x.get('n_gen', 0) > 0), None); print('%.2f' % (g['n_gen']/g['avg_ts']) if g else '0')"); \
+		echo "$${time}s ($${tps} tok/s)"; \
+		llama_cpu_times="$$llama_cpu_times $$time"; \
+	done; \
+	echo "[bench] llama.cpp metal - 5 runs"; \
+	llama_metal_times=""; \
+	for i in 1 2 3 4 5; do \
+		echo -n "  Run $$i: "; \
+		json_file=$(TMP_DIR)/llama_metal_$$i.json; \
+		$(LLAMA_BENCH) -m "$(REF_MODEL)" -ngl 99 -p 1 -n $$tokens -r 1 -o json > $$json_file 2>/dev/null; \
+		tps=$$(python3 -c "import json; d=json.load(open('$$json_file')); g=next((x for x in d if x.get('n_gen', 0) > 0), None); print('%.3f' % g['avg_ts'] if g else '0')"); \
+		time=$$(python3 -c "import json; d=json.load(open('$$json_file')); g=next((x for x in d if x.get('n_gen', 0) > 0), None); print('%.2f' % (g['n_gen']/g['avg_ts']) if g else '0')"); \
+		echo "$${time}s ($${tps} tok/s)"; \
+		llama_metal_times="$$llama_metal_times $$time"; \
+	done; \
+	echo ""; \
+	echo "========================================"; \
+	echo "Results (average of runs 2-5)"; \
+	echo "========================================"; \
+	glm_cpu_avg=$$(echo $$glm_cpu_times | awk '{sum=0; for(i=2;i<=NF;i++) sum+=$$i; print sum/(NF-1)}'); \
+	glm_cpu_tps=$$(echo "$$tokens / $$glm_cpu_avg" | bc -l | awk '{printf "%.3f", $$1}'); \
+	glm_metal_avg=$$(echo $$glm_metal_times | awk '{sum=0; for(i=2;i<=NF;i++) sum+=$$i; print sum/(NF-1)}'); \
+	glm_metal_tps=$$(echo "$$tokens / $$glm_metal_avg" | bc -l | awk '{printf "%.3f", $$1}'); \
+	llama_cpu_avg=$$(echo $$llama_cpu_times | awk '{sum=0; for(i=2;i<=NF;i++) sum+=$$i; print sum/(NF-1)}'); \
+	llama_cpu_tps=$$(echo "$$tokens / $$llama_cpu_avg" | bc -l | awk '{printf "%.3f", $$1}'); \
+	llama_metal_avg=$$(echo $$llama_metal_times | awk '{sum=0; for(i=2;i<=NF;i++) sum+=$$i; print sum/(NF-1)}'); \
+	llama_metal_tps=$$(echo "$$tokens / $$llama_metal_avg" | bc -l | awk '{printf "%.3f", $$1}'); \
 	printf "%-22s %8s\n" "mode" "tok/s"; \
 	printf "%-22s %8s\n" "glm.c cpu (omp=$(BENCH_OMP_THREADS))" "$$glm_cpu_tps"; \
 	printf "%-22s %8s\n" "glm.c metal" "$$glm_metal_tps"; \
 	printf "%-22s %8s\n" "llama.cpp cpu" "$$llama_cpu_tps"; \
 	printf "%-22s %8s\n" "llama.cpp metal" "$$llama_metal_tps"; \
-	echo "[artifacts] $$glm_cpu_out $$glm_cpu_time $$glm_metal_out $$glm_metal_time $$llama_cpu_json $$llama_metal_json"
+	echo "========================================"
 
 .PHONY: bench-metal-phases
 bench-metal-phases: build-metal tmp-dir
@@ -571,10 +603,10 @@ bench-native-fast-profile: build-metal tmp-dir
 	first_log="$(TMP_DIR)/glm_native_fast_decode_first.log"; \
 	steady_log="$(TMP_DIR)/glm_native_fast_decode_steady.log"; \
 	echo "[bench] native-fast first decode token"; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 2 -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$first_json" > "$$first_log" 2>&1; \
 	echo "[bench] native-fast steady decode estimate"; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_NATIVE_STEADY_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$steady_json" > "$$steady_log" 2>&1; \
 	first_tps=$$(F="$$first_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
 	steady_tps=$$(F1="$$first_json" F2="$$steady_json" python3 -c "import json, os; d1=json.load(open(os.environ['F1']))['decode']; d2=json.load(open(os.environ['F2']))['decode']; t1=(1.0/d1['tok_s']) if d1['tok_s']>0 else float('inf'); n2=max(int(d2['tokens']),1); avg=(1.0/d2['tok_s']) if d2['tok_s']>0 else float('inf'); tail=(n2*avg-t1)/max(n2-1,1); out=(1.0/tail) if tail>0 and tail<float('inf') else 0.0; print(f\"{out:.3f}\")"); \
@@ -593,9 +625,9 @@ bench-native-fast-matrix: build-metal tmp-dir
 	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
 		./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $(BENCH_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$cpu_json" > "$(TMP_DIR)/glm_cpu_decode_matrix.log" 2>&1; \
 	./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$metal_json" > "$(TMP_DIR)/glm_metal_decode_matrix.log" 2>&1; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 2 -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$native_first_json" > "$(TMP_DIR)/glm_native_fast_decode_first.log" 2>&1; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_NATIVE_STEADY_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$native_steady_json" > "$(TMP_DIR)/glm_native_fast_decode_steady.log" 2>&1; \
 	cpu_tps=$$(F="$$cpu_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
 	metal_tps=$$(F="$$metal_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \

@@ -1403,7 +1403,7 @@ static int encode_prompt_bpe(const Tokenizer *tok, const char *prompt, int *ids,
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--backend cpu|metal] [--debug] [--self-test-tokenizer] [--bench-mode full|prefill|decode] [--bench-report PATH] [--bench-kernel NAME] [--bench-iters N] [--bench-warmup N]\n", prog);
+    fprintf(stderr, "Usage: %s <checkpoint.bin> [-n N] [-i PROMPT|-f PROMPT_FILE] [-m completion|chat] [-T CONTEXT] [-t TEMP] [--seed N] [--backend cpu|metal] [--debug] [--self-test-tokenizer] [--bench-mode full|prefill|decode] [--bench-report PATH]\n", prog);
 }
 
 typedef enum {
@@ -1989,7 +1989,7 @@ int glm_app_main(int argc, char **argv) {
     }
 
     const char *checkpoint = argv[1];
-    int n_tokens = 16;
+    int n_tokens = 100;
     const char *prompt = "";
     const char *prompt_path = NULL;
     const char *mode = "completion";
@@ -2002,9 +2002,6 @@ int glm_app_main(int argc, char **argv) {
     BackendType backend = BACKEND_CPU;
     BenchMode bench_mode = BENCH_MODE_OFF;
     const char *bench_report_path = NULL;
-    const char *bench_kernel = NULL;
-    int bench_iters = 128;
-    int bench_warmup = 16;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_tokens = atoi(argv[++i]);
@@ -2028,15 +2025,6 @@ int glm_app_main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--bench-report") == 0 && i + 1 < argc) {
             bench_report_path = argv[++i];
-        }
-        else if (strcmp(argv[i], "--bench-kernel") == 0 && i + 1 < argc) {
-            bench_kernel = argv[++i];
-        }
-        else if (strcmp(argv[i], "--bench-iters") == 0 && i + 1 < argc) {
-            bench_iters = atoi(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--bench-warmup") == 0 && i + 1 < argc) {
-            bench_warmup = atoi(argv[++i]);
         }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
@@ -2064,8 +2052,6 @@ int glm_app_main(int argc, char **argv) {
         fprintf(stderr, "Error: temperature must be >= 0.\n");
         return 1;
     }
-    if (bench_iters < 1) bench_iters = 1;
-    if (bench_warmup < 0) bench_warmup = 0;
     if (context_limit < 0) {
         fprintf(stderr, "Error: context limit must be >= 0.\n");
         return 1;
@@ -2185,41 +2171,7 @@ int glm_app_main(int argc, char **argv) {
 
     RunState st;
     runstate_build(&st, &rt, cache_cap);
-    if (bench_kernel != NULL) {
-        setenv("GLM_METAL_FORCE_INIT", "1", 0);
-    }
     int use_metal = glm_backend_init(backend, &rt, &st);
-
-    if (bench_kernel != NULL) {
-        if (backend != BACKEND_METAL) {
-            fprintf(stderr, "[glm-kbench] --bench-kernel requires --backend metal\n");
-            glm_backend_free(use_metal);
-            free(prompt_ids);
-            free(prompt_file_buf);
-            runstate_free(&st);
-            tokenizer_free(&tok);
-            runtime_close(&rt);
-            return 1;
-        }
-        if (!use_metal) {
-            fprintf(stderr, "[glm-kbench] metal backend unavailable\n");
-            glm_backend_free(use_metal);
-            free(prompt_ids);
-            free(prompt_file_buf);
-            runstate_free(&st);
-            tokenizer_free(&tok);
-            runtime_close(&rt);
-            return 1;
-        }
-        int kst = glm_backend_metal_microbench(use_metal, &rt, bench_kernel, bench_iters, bench_warmup);
-        glm_backend_free(use_metal);
-        free(prompt_ids);
-        free(prompt_file_buf);
-        runstate_free(&st);
-        tokenizer_free(&tok);
-        runtime_close(&rt);
-        return kst == 0 ? 0 : 1;
-    }
 
     int token = prompt_ids[0];
     if (token < 0 || token >= rt.cfg.vocab_size) token = 0;
