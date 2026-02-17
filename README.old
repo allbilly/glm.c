@@ -84,7 +84,6 @@ GLM_METAL_NATIVE_PARITY_LAYERS=2 \
 ```
 
 Notes:
-- `GLM_METAL_NATIVE_FFN_CPU=1` (default) runs FFN in CPU parity stage while attention runs native fused kernel.
 - `GLM_METAL_NATIVE_PARITY_STAGE=attn|ffn|both` controls which checkpoint stage is compared/logged.
 
 ## Apple AMX and BLAS

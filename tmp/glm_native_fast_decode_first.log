@@ -1,4 +1,0 @@
-[glm-metal] initialized device=Apple M4 native=on native_unsafe=on native_ffn_cpu=off native_backup=off hybrid_matvec=off
-[glm-metal] uploaded 47 layers to GPU
-[glm-metal] prepared GPU buffers for native forward
-[glm-bench] phase=decode tokens=1 tok_s=9.248 mean_ms=108.132 p50_ms=108.132 p95_ms=108.132 active_bytes=4512319232 est_bw_gbps=41.730

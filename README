@@ -2,9 +2,9 @@
 
 | Mode | Tokens | tok/s | Notes |
 | --- | ---: | ---: | --- |
-| glm.c CPU (OMP=8) | 16 | **1.837** | `make bench-tps` sample |
-| glm.c Metal (SIMD-group) | 16 | **3.791** | `make bench-tps` sample |
-| glm.c Metal native-fast (first token) | 2 | **9.248** | `make bench-native-fast-matrix` |
-| glm.c Metal native-fast (steady est) | 4 | **9.187** | tail estimate (`BENCH_NATIVE_STEADY_TOKENS=4`) |
-| llama.cpp CPU | 16 | **7.846** | +327% vs glm.c CPU |
-| llama.cpp Metal | 16 | **22.981** | +506% vs glm.c Metal |
+| glm.c CPU (OMP=8) | 16 | **6.014** | `make bench-tps` sample |
+| glm.c Metal (default path) | 16 | **5.283** | CPU fallback path |
+| glm.c Metal native-fast (first token) | 2 | **9.346** | `make bench-native-fast-matrix` |
+| glm.c Metal native-fast (steady est) | 4 | **9.279** | tail estimate (`BENCH_NATIVE_STEADY_TOKENS=4`) |
+| llama.cpp CPU | 16 | **7.846** | +30% vs glm.c CPU |
+| llama.cpp Metal | 16 | **22.981** | +147% vs glm.c Metal native-fast |

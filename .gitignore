@@ -1,3 +1,6 @@
 *.gguf
 model/*
 glm4.7-flash
+infer.metallib
+infer.air
+tmp/*

@@ -1,1 +1,0 @@
-[glm-bench] phase=decode tokens=15 tok_s=4.944 mean_ms=202.277 p50_ms=193.370 p95_ms=237.303 active_bytes=4540955392 est_bw_gbps=22.449

@@ -1,4 +1,0 @@
-[glm-metal] no active Metal feature requested, using CPU-compatible path
-real 4.22
-user 11.07
-sys 4.58

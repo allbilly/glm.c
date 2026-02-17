@@ -571,10 +571,10 @@ bench-native-fast-profile: build-metal tmp-dir
 	first_log="$(TMP_DIR)/glm_native_fast_decode_first.log"; \
 	steady_log="$(TMP_DIR)/glm_native_fast_decode_steady.log"; \
 	echo "[bench] native-fast first decode token"; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 2 -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$first_json" > "$$first_log" 2>&1; \
 	echo "[bench] native-fast steady decode estimate"; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_NATIVE_STEADY_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$steady_json" > "$$steady_log" 2>&1; \
 	first_tps=$$(F="$$first_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
 	steady_tps=$$(F1="$$first_json" F2="$$steady_json" python3 -c "import json, os; d1=json.load(open(os.environ['F1']))['decode']; d2=json.load(open(os.environ['F2']))['decode']; t1=(1.0/d1['tok_s']) if d1['tok_s']>0 else float('inf'); n2=max(int(d2['tokens']),1); avg=(1.0/d2['tok_s']) if d2['tok_s']>0 else float('inf'); tail=(n2*avg-t1)/max(n2-1,1); out=(1.0/tail) if tail>0 and tail<float('inf') else 0.0; print(f\"{out:.3f}\")"); \
@@ -593,9 +593,9 @@ bench-native-fast-matrix: build-metal tmp-dir
 	env OMP_NUM_THREADS=$(BENCH_OMP_THREADS) OMP_PROC_BIND=$(BENCH_OMP_PROC_BIND) OMP_PLACES=$(BENCH_OMP_PLACES) \
 		./$(BIN) "$(NATIVE_MODEL)" --backend cpu -n $(BENCH_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$cpu_json" > "$(TMP_DIR)/glm_cpu_decode_matrix.log" 2>&1; \
 	./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$metal_json" > "$(TMP_DIR)/glm_metal_decode_matrix.log" 2>&1; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n 2 -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$native_first_json" > "$(TMP_DIR)/glm_native_fast_decode_first.log" 2>&1; \
-	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_FFN_CPU=0 GLM_METAL_NATIVE_BACKUP=0 \
+	env GLM_METAL_NATIVE=1 GLM_METAL_NATIVE_UNSAFE=1 GLM_METAL_NATIVE_BACKUP=0 \
 		./$(BIN) "$(NATIVE_MODEL)" --backend metal -n $(BENCH_NATIVE_STEADY_TOKENS) -t 0 --seed 0 -i "$$prompt" --bench-mode decode --bench-report "$$native_steady_json" > "$(TMP_DIR)/glm_native_fast_decode_steady.log" 2>&1; \
 	cpu_tps=$$(F="$$cpu_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \
 	metal_tps=$$(F="$$metal_json" python3 -c "import json, os; d=json.load(open(os.environ['F'])); print(f\"{d['decode']['tok_s']:.3f}\")"); \

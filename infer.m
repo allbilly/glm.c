@@ -27,7 +27,6 @@ static int g_cfg_native = -1;
 static int g_cfg_hybrid_matvec = -1;
 static int g_cfg_native_strict = -1;
 static int g_cfg_native_unsafe = -1;
-static int g_cfg_native_ffn_cpu = -1;
 static int g_cfg_native_backup = -1;
 static int g_cfg_native_parity = -1;
 static int g_cfg_native_parity_all_pos = -1;
@@ -136,10 +135,6 @@ static int metal_native_strict(void) {
 
 static int metal_native_unsafe_enabled(void) {
     return env_flag_cached("GLM_METAL_NATIVE_UNSAFE", &g_cfg_native_unsafe, 0);
-}
-
-static int metal_native_ffn_cpu_enabled(void) {
-    return env_flag_cached("GLM_METAL_NATIVE_FFN_CPU", &g_cfg_native_ffn_cpu, 0);
 }
 
 static int metal_native_backup_enabled(void) {
@@ -926,11 +921,10 @@ int glm_metal_init(const Runtime *rt, RunState *st) {
     if (!g_model.output_norm || !g_model.tok_q || !g_model.tok_s || !g_model.out_q || !g_model.out_s) return -1;
 
     fprintf(stderr,
-            "[glm-metal] initialized device=%s native=%s native_unsafe=%s native_ffn_cpu=%s native_backup=%s hybrid_matvec=%s\n",
+            "[glm-metal] initialized device=%s native=%s native_unsafe=%s native_backup=%s hybrid_matvec=%s\n",
             g_device.name.UTF8String,
             metal_native_enabled() ? "on" : "off",
             metal_native_unsafe_enabled() ? "on" : "off",
-            metal_native_ffn_cpu_enabled() ? "on" : "off",
             metal_native_backup_enabled() ? "on" : "off",
             metal_hybrid_matvec_enabled() ? "on" : "off");
     return 0;
@@ -1161,7 +1155,7 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
 
     const int parity_requested = metal_native_parity_enabled() && (pos == 0 || metal_native_parity_all_pos());
     const int parity_stage = metal_native_parity_stage();
-    int cpu_ffn_enabled = metal_native_ffn_cpu_enabled();
+    int cpu_ffn_enabled = 0;
     if (parity_requested && (parity_stage == GLM_NATIVE_PARITY_STAGE_FFN || parity_stage == GLM_NATIVE_PARITY_STAGE_BOTH)) {
         cpu_ffn_enabled = 1;
     }
@@ -1232,17 +1226,7 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
                 parity_stage);
     }
 
-    float *gpu_attn_snapshot = NULL;
-    int need_gpu_attn_snapshot = (parity_stage == GLM_NATIVE_PARITY_STAGE_ATTN || parity_stage == GLM_NATIVE_PARITY_STAGE_BOTH);
-    if (need_gpu_attn_snapshot && cpu_ffn_enabled) {
-        gpu_attn_snapshot = (float *)malloc((size_t)cfg->dim * sizeof(float));
-        if (!gpu_attn_snapshot) {
-            free(cpu_layer_ckpt);
-            free(cpu_attn_ckpt);
-            fprintf(stderr, "[glm-metal] native parity: failed to allocate GPU attn snapshot buffer\n");
-            return -1;
-        }
-    }
+    // With unified memory on Apple Silicon, no need to snapshot - read directly from Metal buffer
 
     int per_layer_sync = cpu_ffn_enabled || (cpu_layer_ckpt != NULL) || (cpu_attn_ckpt != NULL);
     id<MTLCommandBuffer> cb = nil;
@@ -1253,7 +1237,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
             fprintf(stderr, "[glm-metal] native forward: failed to create command buffer\n");
             free(cpu_layer_ckpt);
             free(cpu_attn_ckpt);
-            free(gpu_attn_snapshot);
             return -1;
         }
         fast_encoder = [cb computeCommandEncoder];
@@ -1261,7 +1244,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
             fprintf(stderr, "[glm-metal] native forward: failed to create fast-path encoder\n");
             free(cpu_layer_ckpt);
             free(cpu_attn_ckpt);
-            free(gpu_attn_snapshot);
             return -1;
         }
     }
@@ -1303,7 +1285,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
                 fprintf(stderr, "[glm-metal] native forward: failed to create layer command buffer\n");
                 free(cpu_layer_ckpt);
                 free(cpu_attn_ckpt);
-                free(gpu_attn_snapshot);
                 return -1;
             }
             encoder = [cb_layer computeCommandEncoder];
@@ -1311,7 +1292,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
                 fprintf(stderr, "[glm-metal] native forward: failed to create layer encoder\n");
                 free(cpu_layer_ckpt);
                 free(cpu_attn_ckpt);
-                free(gpu_attn_snapshot);
                 return -1;
             }
         }
@@ -1556,28 +1536,27 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
                 fprintf(stderr, "[glm-metal] native layer=%d failed: %s\n", layer, cb_layer.error.localizedDescription.UTF8String);
                 free(cpu_layer_ckpt);
                 free(cpu_attn_ckpt);
-                free(gpu_attn_snapshot);
                 return -1;
             }
 
             float *gpu_vec = (float *)output_buf.contents;
-            if (gpu_attn_snapshot) {
-                memcpy(gpu_attn_snapshot, gpu_vec, cfg->dim * sizeof(float));
-            }
 
             if (cpu_ffn_enabled) {
-                memcpy(st->x, gpu_vec, cfg->dim * sizeof(float));
+                // On Apple Silicon with unified memory, operate directly on Metal buffer
+                // instead of copying to/from st->x (saves 2 memcopies per layer)
+                float *saved_x = st->x;
+                st->x = gpu_vec;
                 if (layer == 0) {
                     apply_l0_dense_ffn_cpu(rt, st, gs);
                 } else {
                     apply_moe_shared_ffn_layer_cpu(rt, st, gs, layer);
                 }
-                memcpy(gpu_vec, st->x, cfg->dim * sizeof(float));
+                st->x = saved_x;
             }
 
             if (cpu_attn_ckpt && layer < cpu_attn_layers_written) {
                 const float *cpu_vec = cpu_attn_ckpt + (size_t)layer * (size_t)cfg->dim;
-                const float *gpu_cmp = gpu_attn_snapshot ? gpu_attn_snapshot : gpu_vec;
+                const float *gpu_cmp = gpu_vec;
                 double l1 = 0.0;
                 float linf = 0.0f;
                 int max_idx = 0;
@@ -1620,7 +1599,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
             [fast_encoder endEncoding];
             free(cpu_layer_ckpt);
             free(cpu_attn_ckpt);
-            free(gpu_attn_snapshot);
             fprintf(stderr, "[glm-metal] native forward: missing final kernels\n");
             return -1;
         }
@@ -1652,7 +1630,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
             fprintf(stderr, "[glm-metal] native forward failed: %s\n", cb.error.localizedDescription.UTF8String);
             free(cpu_layer_ckpt);
             free(cpu_attn_ckpt);
-            free(gpu_attn_snapshot);
             return -1;
         }
         memcpy(st->logits, g_run.logits.contents, (size_t)cfg->vocab_size * sizeof(float));
@@ -1665,7 +1642,6 @@ int glm_metal_forward_token_native(const Runtime *rt, RunState *st, int token, i
 
     free(cpu_layer_ckpt);
     free(cpu_attn_ckpt);
-    free(gpu_attn_snapshot);
     if (parity_failed) {
         fprintf(stderr,
                 "[glm-metal] native parity failed: at least one layer exceeded tol=%.6g\n",
